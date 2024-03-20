@@ -1,3 +1,145 @@
+燃料クライアントの実装。
+
+貢献
+あなたが燃料に貢献することに興味があるなら、私たちを参照してくださCONTRIBUTING.md コーディング標準とレビュープロセスのためのガイドライン。
+
+変更をプッシュしたり、プルリクエストを作成する前に、sourceを実行してくださいci_checks.sh...
+
+建物
+システム要件
+Clangを含むいくつかのシステム要件があります。
+
+MacOS
+brew更新
+brewインストールcmake
+Debian
+aptアップデート
+apt install-y cmake pkg-config build-essential git clang libclang-dev
+アーチ
+pacman-Syu--needed--noconfirm cmake gcc pkgconf git clang
+コンパイル
+Xtaskを使用してfuel-coreを構築することをお勧めします:
+
+カーゴxtaskビルド
+これにより、クライアント用のGraphQLスキーマを再生成するなど、cargo buildとその他のカスタムビルドプロセスが実行されます。
+
+テスト
+ザ-ci_checks.sh スクリプトファイルは、テストの実行を含むすべてのCIチェックを実行するために使用できます。
+
+ソースci_checks.sh
+スクリプトには、事前にインストールされたツールが必要です。 より多くの情報の操業のため:
+
+猫ci_checks.sh
+ランニング
+このサービスは、fuel-core runを実行することで起動できます。 実行するためのオプションのリストには、ヘルプオプションを使用してアクセスできます:
+
+$ ./target/debug/fuel-core run--help
+
+使用法:
+    フューエルコアラン[オプション]
+
+オプション:
+        --chain<CHAIN_CONFIG>
+            組み込み構成へのエイリアスまたはjsonファイルへのファイルパスのいずれかを指定します[デフォルト:
+            local_testnet]
+        ...
+多くの開発目的では、永続化されない状態を持つことが有用であり、次の例のようにdb-typeオプションをin-memoryに設定することができます。
+
+例を示します。
+$ ./target/debug/fuel-core run--db-type in-memory
+2023-06-13T12：45：22.860536Z INFO fuel_core::cli::run:230:Block production mode:Instant
+2023-06-13T12：38：47.059783Z INFO fuel_core::cli::run:310:Fuel Coreバージョンv0.18.1
+2023-06-13T12：38：47.078969Z INFO new{name=fuel-core}:_commit_result{block_id=b1807ca9f2eec7e459b866ecf69b68679fc6b205a9a85c16bd4943d1bfc6fb2a height=0tx_status=[]}:fuel_core_importer::IMPORTER:231:コミットされたブロック
+2023-06-13T12：38：47.097777Z INFO new{name=fuel-core}：fuel_core::graphql_api::service:208：GraphQLプロバイダーを127.0.0.1：4000にバインドする
+ローカルノードでブロック生成を無効にするには、--poa-instant=falseを設定します
+
+例を示します。
+$ ./target/debug/fuel-core run--poa-instant=false
+2023-06-13T12：44：12.857763Z INFO fuel_core::cli::run:232:ブロック生産が無効になっています
+トラブルシューティング
+出版
+私たちは、すべての木枠の自動公開のためにpublish-cratesアクションを使用しています。
+
+公開に問題がある場合は、actを使用してローカルでトラブルシューティングできます。
+
+act release-s GITHUB_TOKEN=<YOUR_GITHUB_TOKEN>-j publish-crates-check--container-architecture linux/amd64--reuse
+GitHubへのリクエストを行うには、GitHubTokenが必要です。 あなたはこの命令でそれを作成することができます。
+
+古いデータベース
+次のようなエラーが発生した場合
+
+スレッド'main'は'データベースを開くことができません：DatabaseError（エラー{メッセージ："無効な引数：列ファミリが開かれていません：column-11、column-10、column-9、column-8、column-7、column-6、column-5、column-4、column-3、column-2、column-1、column-0"}）'、fuel-core/src/main.rs:23:66
+Rm-rf~/を使用してローカルデータベースをクリアします。燃料/db
+
+ファイル記述子の制限
+一部のmacOSバージョンでは、デフォルトのファイル記述子の制限が非常に低く、開いているファイルが多すぎるなどのメッセージでIOエラーが発生したり、致命的なランタイムエラーが発生したりする可能性があります。RocksDBがこれらの問題に遭遇した場合、Rustは外部の例外をキャッチできません。 開いているファイルの制限を増やすには、次のコマンドを使用します。 これは現在のシェルセッションにのみ影響するので、~/に追加することを検討してください。zshrc。
+
+ulimit-n10240
+ログレベル
+このサービスは環境変数RUST_LOGに依存しています。 詳細については、EnvFilter examplesクレートを確認してください。
+
+ヒューマンロギングは、環境変数HUMAN_LOGGING=falseで無効にすることができます
+
+デバッグ
+ローカルノードのデバッグビルドの実行の概要については、"デバッグガイド"を参照してください。
+
+ドッカー＆Kubernetes
+#Dockerイメージを作成する
+ドッカービルド-t燃料コア。 -fデプロイメント/Dockerfile
+
+#Dockerイメージの削除
+ドッカー画像rm燃料コア
+
+#Kubernetesのボリューム、デプロイ、サービスを作成する
+kubectl create-f deployment/fuel-core.yml
+
+#Kubernetesのボリューム、展開、サービスの削除
+kubectl delete-f deployment/fuel-core.yml
+GraphQLサービス
+クライアント機能は、GraphQLクエリを期待するサービスエンドポイントを介して使用できます。
+
+トランザクションエグゼキュータ
+現在、トランザクションエグゼキュータは即時ブロック生成を実行します。 変更はデフォルトでRocksDBに永続化されます。
+
+サービスエンドポイント：/v1/graphql
+スキーマ（ビルド後に使用可能）：crates/client/assets/schema。sdl
+サービスは、ここで指定されているように、hexエンコードされたバイナリ形式でトランザクションを受信するsubmitとして定義された
+
+カールの例
+この例では、次の一連のASMを表すスクリプトを実行します:
+
+ADDI(0x10,RegId::ZERO,0xca),
+ADDI(0x11,RegId::ZERO,0xba),
+ログ(0x10,0x11,RegId::ZERO,RegId::ZERO),
+RET(RegId::ONE),
+$cargo run--bin fuel-core-client--transaction submit \
+"{\"Script\":{\"script_gas_limit\":1000000,\"policies\":{\"bits\":\"GasPrice\",\"values\":[0,0,0,0]},\"maturity\":0,\"script\":[80,64,0,202,80,68,0,186,51,65,16,0,36,4,0,0],\"script_data\":[],\"inputs\":[
+{
+  私はこれを試してみました：
+    \"utxo_id\":{
+      "tx_id":\"c49d65de61cf04588a764b557d25cc6c6b4bc0d7429227e2a21e61c213b3a3e2\",
+      私のコードは次のとおりです。
+    },
+    "所有者":\"f1e92c42b90934aa6372e30bc568a326f6e66a1a0288595e6e3fbd392a4f3e6e\",
+    "量":10599410012256088338,
+    "asset_id\":\"2cafad611543e0265d89f1c2b60d9ebf5d56ad7e23d9827d6b522fd4d6e44bc3\",
+    \"tx_pointer\":{
+      ブロックの高さを指定します。,
+      \"tx_index\":0
+    },
+    \"witness_index\":0,
+    \"成熟度\":0,
+    \"predicate_gas_used\":null,
+    \"predicate\":null,
+    私はこの問題を解決しました。
+  }
+これを行うには、次のコマンドを実行します。
+  \"データ\":[
+    150,31,98,51,6,239,255,243,45,35,182,26,129,152,46,95,45,211,114,58,51,64,129,194,97,14,181,70,190,37,106,223,170,174,221,230,87,239,67,224,100,137,25,249,193,14,184,195,15,85,156,82,91,78,91,80,126,168,215,170,139,48,19,5
+  ]
+これは、次のコマンドを実行して、次のコマンドを実行して実行しています。
+
+
 # Fuel Client
 
 [![build](https://github.com/FuelLabs/fuel-core/actions/workflows/ci.yml/badge.svg)](https://github.com/FuelLabs/fuel-core/actions/workflows/ci.yml)
