@@ -3,7 +3,6 @@ use fuel_core::{
         CoinConfig,
         CoinConfigGenerator,
         StateConfig,
-        StateReader,
     },
     database::Database,
     service::{
@@ -34,11 +33,7 @@ async fn setup_service(configs: Vec<CoinConfig>) -> FuelService {
         coins: configs,
         ..Default::default()
     };
-
-    let config = Config {
-        state_reader: StateReader::in_memory(state),
-        ..Config::local_node()
-    };
+    let config = Config::local_node_with_state_config(state);
 
     FuelService::from_database(Database::default(), config)
         .await
@@ -155,7 +150,7 @@ async fn get_coins_forwards_backwards(
             owner,
             amount: i as Word,
             asset_id,
-            output_index: i as u8,
+            output_index: i as u16,
             ..Default::default()
         })
         .collect();

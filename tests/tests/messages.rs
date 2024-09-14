@@ -4,7 +4,6 @@ use fuel_core::{
     chain_config::{
         MessageConfig,
         StateConfig,
-        StateReader,
     },
     service::{
         Config,
@@ -22,6 +21,7 @@ use fuel_core_client::client::{
     },
     FuelClient,
 };
+use fuel_core_storage::tables::Coins;
 use fuel_core_types::{
     fuel_asm::{
         op,
@@ -50,10 +50,7 @@ fn setup_config(messages: impl IntoIterator<Item = MessageConfig>) -> Config {
         ..Default::default()
     };
 
-    Config {
-        state_reader: StateReader::in_memory(state),
-        ..Config::local_node()
-    }
+    Config::local_node_with_state_config(state)
 }
 
 #[tokio::test]
@@ -295,13 +292,14 @@ async fn can_get_message_proof() {
         let config = Config::local_node();
 
         let coin = config
-            .state_reader
-            .coins()
+            .snapshot_reader
+            .read::<Coins>()
             .unwrap()
+            .into_iter()
             .next()
             .unwrap()
-            .unwrap()
-            .data[0]
+            .unwrap()[0]
+            .value
             .clone();
 
         struct MessageArgs {
@@ -405,7 +403,7 @@ async fn can_get_message_proof() {
             Default::default(),
             owner,
             1000,
-            coin.asset_id,
+            *coin.asset_id(),
             TxPointer::default(),
             Default::default(),
             predicate,
@@ -519,11 +517,11 @@ async fn can_get_message_proof() {
                 .map(Bytes32::from)
                 .collect();
             assert!(verify_merkle(
-                result.message_block_header.message_receipt_root,
+                result.message_block_header.message_outbox_root,
                 &generated_message_id,
                 message_proof_index,
                 &message_proof_set,
-                result.message_block_header.message_receipt_count,
+                result.message_block_header.message_receipt_count as u64,
             ));
 
             // Generate a proof to compare
@@ -539,7 +537,7 @@ async fn can_get_message_proof() {
 
             // Check the root matches the proof and the root on the header.
             assert_eq!(
-                <[u8; 32]>::from(result.message_block_header.message_receipt_root),
+                <[u8; 32]>::from(result.message_block_header.message_outbox_root),
                 expected_root
             );
 
@@ -588,13 +586,12 @@ async fn can_get_message() {
         ..Default::default()
     };
 
-    // configure the messges
-    let mut config = Config::local_node();
+    // configure the messages
     let state_config = StateConfig {
         messages: vec![first_msg.clone()],
         ..Default::default()
     };
-    config.state_reader = StateReader::in_memory(state_config);
+    let config = Config::local_node_with_state_config(state_config);
 
     // setup service and client
     let service = FuelService::new_node(config).await.unwrap();
@@ -610,8 +607,7 @@ async fn can_get_message() {
 
 #[tokio::test]
 async fn can_get_empty_message() {
-    let mut config = Config::local_node();
-    config.state_reader = StateReader::in_memory(StateConfig::default());
+    let config = Config::local_node_with_state_config(StateConfig::default());
 
     let service = FuelService::new_node(config).await.unwrap();
     let client = FuelClient::from(service.bound_address);

@@ -5,15 +5,18 @@ use crate::{
         CoinConfig,
         CoinConfigGenerator,
     },
+    combined_database::CombinedDatabase,
     database::Database,
     p2p::Multiaddr,
     service::{
         Config,
         FuelService,
-        ServiceTrait,
     },
 };
-use fuel_core_chain_config::StateReader;
+use fuel_core_chain_config::{
+    ConsensusConfig,
+    StateConfig,
+};
 use fuel_core_p2p::{
     codecs::postcard::PostcardCodec,
     network_service::FuelP2PService,
@@ -22,10 +25,12 @@ use fuel_core_p2p::{
 };
 use fuel_core_poa::{
     ports::BlockImporter,
+    signer::SignMode,
     Trigger,
 };
 use fuel_core_storage::{
     tables::Transactions,
+    transactional::AtomicView,
     StorageAsRef,
 };
 use fuel_core_types::{
@@ -225,7 +230,7 @@ pub async fn make_nodes(
     let mut producers_with_txs = Vec::with_capacity(producers.len());
 
     let mut config = config.unwrap_or_else(Config::local_node);
-    let mut state_config = config.state_reader.state_config().unwrap();
+    let mut state_config = StateConfig::from_reader(&config.snapshot_reader).unwrap();
 
     for (all, producer) in txs_coins.into_iter().zip(producers.into_iter()) {
         match all {
@@ -243,7 +248,10 @@ pub async fn make_nodes(
         }
     }
 
-    config.state_reader = StateReader::in_memory(state_config);
+    config.snapshot_reader = config
+        .snapshot_reader
+        .clone()
+        .with_state_config(state_config);
 
     let bootstrap_nodes: Vec<Bootstrap> =
         futures::stream::iter(bootstrap_setup.into_iter().enumerate())
@@ -259,11 +267,7 @@ pub async fn make_nodes(
                         config.clone(),
                     );
                     if let Some(BootstrapSetup { pub_key, .. }) = boot {
-                        match &mut node_config.chain_config.consensus {
-                            crate::chain_config::ConsensusConfig::PoA { signing_key } => {
-                                *signing_key = pub_key;
-                            }
-                        }
+                        update_signing_key(&mut node_config, pub_key);
                     }
                     Bootstrap::new(&node_config).await
                 }
@@ -299,22 +303,27 @@ pub async fn make_nodes(
         {
             match bootstrap_type {
                 BootstrapType::BootstrapNodes => {
-                    node_config.p2p.as_mut().unwrap().bootstrap_nodes = boots.clone();
+                    node_config
+                        .p2p
+                        .as_mut()
+                        .unwrap()
+                        .bootstrap_nodes
+                        .clone_from(&boots);
                 }
                 BootstrapType::ReservedNodes => {
-                    node_config.p2p.as_mut().unwrap().reserved_nodes = boots.clone();
+                    node_config
+                        .p2p
+                        .as_mut()
+                        .unwrap()
+                        .reserved_nodes
+                        .clone_from(&boots);
                 }
             }
 
             node_config.utxo_validation = utxo_validation;
-            let pub_key = secret.public_key();
-            match &mut node_config.chain_config.consensus {
-                crate::chain_config::ConsensusConfig::PoA { signing_key } => {
-                    *signing_key = Input::owner(&pub_key);
-                }
-            }
+            update_signing_key(&mut node_config, Input::owner(&secret.public_key()));
 
-            node_config.consensus_key = Some(Secret::new(secret.into()));
+            node_config.consensus_signer = SignMode::Key(Secret::new(secret.into()));
 
             test_txs = txs;
         }
@@ -346,17 +355,23 @@ pub async fn make_nodes(
 
             match bootstrap_type {
                 BootstrapType::BootstrapNodes => {
-                    node_config.p2p.as_mut().unwrap().bootstrap_nodes = boots.clone();
+                    node_config
+                        .p2p
+                        .as_mut()
+                        .unwrap()
+                        .bootstrap_nodes
+                        .clone_from(&boots);
                 }
                 BootstrapType::ReservedNodes => {
-                    node_config.p2p.as_mut().unwrap().reserved_nodes = boots.clone();
+                    node_config
+                        .p2p
+                        .as_mut()
+                        .unwrap()
+                        .reserved_nodes
+                        .clone_from(&boots);
                 }
             }
-            match &mut node_config.chain_config.consensus {
-                crate::chain_config::ConsensusConfig::PoA { signing_key } => {
-                    *signing_key = pub_key;
-                }
-            }
+            update_signing_key(&mut node_config, pub_key);
         }
         validators.push(make_node(node_config, Vec::with_capacity(0)).await)
     }
@@ -368,6 +383,21 @@ pub async fn make_nodes(
     }
 }
 
+fn update_signing_key(config: &mut Config, key: Address) {
+    let snapshot_reader = &config.snapshot_reader;
+
+    let mut chain_config = snapshot_reader.chain_config().clone();
+    match &mut chain_config.consensus {
+        ConsensusConfig::PoA { signing_key } => {
+            *signing_key = key;
+        }
+        ConsensusConfig::PoAV2(poa) => {
+            poa.set_genesis_signing_key(key);
+        }
+    }
+    config.snapshot_reader = snapshot_reader.clone().with_chain_config(chain_config)
+}
+
 pub fn make_config(name: String, mut node_config: Config) -> Config {
     node_config.p2p = Config::local_node().p2p;
     node_config.utxo_validation = true;
@@ -377,12 +407,21 @@ pub fn make_config(name: String, mut node_config: Config) -> Config {
 
 pub async fn make_node(node_config: Config, test_txs: Vec<Transaction>) -> Node {
     let db = Database::in_memory();
+    // Test coverage slows down the execution a lot, and while running all tests,
+    // it may require a lot of time to start the node. We have a
+    // timeout here to watch infinity loops, so it is okay to use 120 seconds.
+    let time_limit = Duration::from_secs(120);
     let node = tokio::time::timeout(
-        Duration::from_secs(2),
+        time_limit,
         FuelService::from_database(db.clone(), node_config),
     )
     .await
-    .expect("All services should start in less than 2 seconds")
+    .unwrap_or_else(|_| {
+        panic!(
+            "All services should start in less than {} seconds",
+            time_limit.as_secs()
+        )
+    })
     .expect("The `FuelService should start without error");
 
     let config = node.shared.config.clone();
@@ -396,13 +435,13 @@ pub async fn make_node(node_config: Config, test_txs: Vec<Transaction>) -> Node 
 
 async fn extract_p2p_config(node_config: &Config) -> fuel_core_p2p::config::Config {
     let bootstrap_config = node_config.p2p.clone();
-    let db = Database::in_memory();
+    let db = CombinedDatabase::in_memory();
     crate::service::genesis::execute_and_commit_genesis_block(node_config, &db)
         .await
         .unwrap();
     bootstrap_config
         .unwrap()
-        .init(db.get_genesis().unwrap())
+        .init(db.on_chain().latest_view().unwrap().get_genesis().unwrap())
         .unwrap()
 }
 
@@ -421,7 +460,12 @@ impl Node {
             .block_stream()
             .take(number_of_blocks);
         while let Some(block) = stream.next().await {
-            assert_eq!(block.is_locally_produced(), is_local);
+            if block.is_locally_produced() != is_local {
+                panic!(
+                    "Block produced by the wrong node while was \
+                    waiting for `{number_of_blocks}` and is_local=`{is_local}`"
+                );
+            }
         }
     }
 
@@ -434,7 +478,7 @@ impl Node {
                 result = blocks.next() => {
                     result.unwrap();
                 }
-                _ = self.node.await_stop() => {
+                _ = self.node.await_shutdown() => {
                     panic!("Got a stop signal")
                 }
             }
@@ -498,7 +542,10 @@ impl Node {
 
     /// Stop a node.
     pub async fn shutdown(&mut self) {
-        self.node.stop_and_await().await.unwrap();
+        self.node
+            .send_stop_signal_and_await_shutdown()
+            .await
+            .unwrap();
     }
 }
 

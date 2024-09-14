@@ -1,10 +1,13 @@
 use crate::{
     containers::{
         dependency::Dependency,
-        price_sort::TipSort,
         time_sort::TimeSort,
+        tip_per_gas_sort::RatioGasTipSort,
     },
-    ports::TxPoolDb,
+    ports::{
+        TxPoolDb,
+        WasmChecker as WasmCheckerConstraint,
+    },
     service::TxStatusChange,
     types::*,
     Config,
@@ -12,18 +15,18 @@ use crate::{
     TxInfo,
 };
 use fuel_core_types::{
-    fuel_tx::Transaction,
+    fuel_tx::{
+        field::UpgradePurpose as _,
+        Transaction,
+        UpgradePurpose,
+    },
     fuel_types::BlockHeight,
-    fuel_vm::{
-        checked_transaction::{
-            CheckPredicates,
-            Checked,
-            CheckedTransaction,
-            Checks,
-            IntoChecked,
-            ParallelExecutor,
-        },
-        PredicateVerificationFailed,
+    fuel_vm::checked_transaction::{
+        CheckPredicates,
+        Checked,
+        CheckedTransaction,
+        Checks,
+        IntoChecked,
     },
     services::txpool::{
         ArcPoolTx,
@@ -31,10 +34,16 @@ use fuel_core_types::{
     },
     tai64::Tai64,
 };
+use num_rational::Ratio;
 
+use crate::ports::{
+    GasPriceProvider,
+    MemoryPool,
+};
 use fuel_core_metrics::txpool_metrics::txpool_metrics;
 use fuel_core_storage::transactional::AtomicView;
 use fuel_core_types::{
+    blockchain::header::ConsensusParametersVersion,
     fuel_tx::{
         input::{
             coin::{
@@ -48,18 +57,20 @@ use fuel_core_types::{
                 MessageDataSigned,
             },
         },
+        ConsensusParameters,
         Input,
     },
-    fuel_vm::checked_transaction::CheckPredicateParams,
+    fuel_vm::{
+        checked_transaction::CheckPredicateParams,
+        interpreter::Memory,
+    },
     services::executor::TransactionExecutionStatus,
 };
 use std::{
-    cmp::Reverse,
     collections::HashMap,
     ops::Deref,
     sync::Arc,
 };
-use tokio_rayon::AsyncRayonHandle;
 
 #[cfg(test)]
 mod test_helpers;
@@ -67,38 +78,32 @@ mod test_helpers;
 mod tests;
 
 #[derive(Debug, Clone)]
-pub struct TxPool<ViewProvider> {
+pub struct TxPool<ViewProvider, WasmChecker> {
     by_hash: HashMap<TxId, TxInfo>,
-    by_tip: TipSort,
+    by_ratio_gas_tip: RatioGasTipSort,
     by_time: TimeSort,
     by_dependency: Dependency,
     config: Config,
     database: ViewProvider,
+    wasm_checker: WasmChecker,
 }
 
-/// Trait for getting gas price for the Tx Pool code to look up the gas price for a given block height
-pub trait GasPriceProvider {
-    /// Get gas price for specific block height if it is known
-    fn gas_price(&self, block_height: BlockHeight) -> Option<GasPrice>;
-}
-
-impl<T: GasPriceProvider> GasPriceProvider for Arc<T> {
-    fn gas_price(&self, block_height: BlockHeight) -> Option<GasPrice> {
-        self.deref().gas_price(block_height)
-    }
-}
-
-impl<ViewProvider> TxPool<ViewProvider> {
-    pub fn new(config: Config, database: ViewProvider) -> Self {
+impl<ViewProvider, WasmChecker> TxPool<ViewProvider, WasmChecker> {
+    pub fn new(
+        config: Config,
+        database: ViewProvider,
+        wasm_checker: WasmChecker,
+    ) -> Self {
         let max_depth = config.max_depth;
 
         Self {
             by_hash: HashMap::new(),
-            by_tip: TipSort::default(),
+            by_ratio_gas_tip: RatioGasTipSort::default(),
             by_time: TimeSort::default(),
             by_dependency: Dependency::new(max_depth, config.utxo_validation),
             config,
             database,
+            wasm_checker,
         }
     }
 
@@ -122,7 +127,11 @@ impl<ViewProvider> TxPool<ViewProvider> {
 
     /// Return all sorted transactions that are includable in next block.
     pub fn sorted_includable(&self) -> impl Iterator<Item = ArcPoolTx> + '_ {
-        self.by_tip.sort.iter().rev().map(|(_, tx)| tx.clone())
+        self.by_ratio_gas_tip
+            .sort
+            .iter()
+            .rev()
+            .map(|(_, tx)| tx.clone())
     }
 
     pub fn remove_inner(&mut self, tx: &ArcPoolTx) -> Vec<ArcPoolTx> {
@@ -148,7 +157,7 @@ impl<ViewProvider> TxPool<ViewProvider> {
         let info = self.by_hash.remove(tx_id);
         if let Some(info) = &info {
             self.by_time.remove(info);
-            self.by_tip.remove(info);
+            self.by_ratio_gas_tip.remove(info);
         }
 
         info
@@ -174,27 +183,6 @@ impl<ViewProvider> TxPool<ViewProvider> {
 
     pub fn find_one(&self, hash: &TxId) -> Option<TxInfo> {
         self.txs().get(hash).cloned()
-    }
-
-    /// find all dependent tx and return them with requested dependencies in one list sorted by Price.
-    pub fn find_dependent(&self, hashes: &[TxId]) -> Vec<ArcPoolTx> {
-        let mut seen = HashMap::new();
-        {
-            for hash in hashes {
-                if let Some(tx) = self.txs().get(hash) {
-                    self.dependency().find_dependent(
-                        tx.tx().clone(),
-                        &mut seen,
-                        self.txs(),
-                    );
-                }
-            }
-        }
-        let mut list: Vec<_> = seen.into_values().collect();
-        // sort from high to low price
-        list.sort_by_key(|tx| Reverse(tx.tip()));
-
-        list
     }
 
     /// The number of pending transaction in the pool.
@@ -336,18 +324,19 @@ impl<ViewProvider> TxPool<ViewProvider> {
     }
 }
 
-impl<ViewProvider, View> TxPool<ViewProvider>
+impl<ViewProvider, View, WasmChecker> TxPool<ViewProvider, WasmChecker>
 where
-    ViewProvider: AtomicView<View = View>,
+    ViewProvider: AtomicView<LatestView = View>,
     View: TxPoolDb,
+    WasmChecker: WasmCheckerConstraint + Send + Sync,
 {
     #[cfg(test)]
     fn insert_single(
         &mut self,
         tx: Checked<Transaction>,
     ) -> Result<InsertionResult, Error> {
-        let view = self.database.latest_view();
-        self.insert_inner(tx, &view)
+        let view = self.database.latest_view().unwrap();
+        self.insert_inner(tx, ConsensusParametersVersion::MIN, &view)
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(tx_id = %tx.id()), ret, err)]
@@ -355,14 +344,18 @@ where
     fn insert_inner(
         &mut self,
         tx: Checked<Transaction>,
+        version: ConsensusParametersVersion,
         view: &View,
     ) -> Result<InsertionResult, Error> {
         let tx: CheckedTransaction = tx.into();
 
         let tx = Arc::new(match tx {
-            CheckedTransaction::Script(script) => PoolTransaction::Script(script),
-            CheckedTransaction::Create(create) => PoolTransaction::Create(create),
+            CheckedTransaction::Script(tx) => PoolTransaction::Script(tx, version),
+            CheckedTransaction::Create(tx) => PoolTransaction::Create(tx, version),
             CheckedTransaction::Mint(_) => return Err(Error::MintIsDisallowed),
+            CheckedTransaction::Upgrade(tx) => PoolTransaction::Upgrade(tx, version),
+            CheckedTransaction::Upload(tx) => PoolTransaction::Upload(tx, version),
+            CheckedTransaction::Blob(tx) => PoolTransaction::Blob(tx, version),
         });
 
         self.check_blacklisting(tx.as_ref())?;
@@ -371,16 +364,17 @@ where
             return Err(Error::NoMetadata)
         }
 
-        // verify max gas is less than block limit
-        if tx.max_gas() > self.config.chain_config.block_gas_limit {
-            return Err(Error::NotInsertedMaxGasLimit {
-                tx_gas: tx.max_gas(),
-                block_limit: self.config.chain_config.block_gas_limit,
-            })
-        }
-
         if self.by_hash.contains_key(&tx.id()) {
             return Err(Error::NotInsertedTxKnown)
+        }
+
+        // If upgrading transition function, at least check that it is valid wasm
+        if let PoolTransaction::Upgrade(upgrade, _) = tx.as_ref() {
+            if let UpgradePurpose::StateTransition { root } =
+                upgrade.transaction().upgrade_purpose()
+            {
+                self.wasm_checker.validate_uploaded_wasm(root)?;
+            }
         }
 
         let mut max_limit_hit = false;
@@ -388,8 +382,8 @@ where
         if self.by_hash.len() >= self.config.max_tx {
             max_limit_hit = true;
             // limit is hit, check if we can push out lowest priced tx
-            let lowest_tip = self.by_tip.lowest_value().unwrap_or_default();
-            if lowest_tip >= tx.tip() {
+            let lowest_ratio = self.by_ratio_gas_tip.lowest_value().unwrap_or_default();
+            if lowest_ratio >= Ratio::new(tx.tip(), tx.max_gas()) {
                 return Err(Error::NotInsertedLimitHit)
             }
         }
@@ -402,7 +396,7 @@ where
         let rem = self.by_dependency.insert(&self.by_hash, view, &tx)?;
         let info = TxInfo::new(tx.clone());
         let submitted_time = info.submitted_time();
-        self.by_tip.insert(&info);
+        self.by_ratio_gas_tip.insert(&info);
         self.by_time.insert(&info);
         self.by_hash.insert(tx.id(), info);
 
@@ -410,7 +404,7 @@ where
         let removed = if rem.is_empty() {
             if max_limit_hit {
                 // remove last tx from sort
-                let rem_tx = self.by_tip.lowest_tx().unwrap(); // safe to unwrap limit is hit
+                let rem_tx = self.by_ratio_gas_tip.lowest_tx().unwrap(); // safe to unwrap limit is hit
                 self.remove_inner(&rem_tx);
                 vec![rem_tx]
             } else {
@@ -437,15 +431,19 @@ where
     pub fn insert(
         &mut self,
         tx_status_sender: &TxStatusChange,
+        version: ConsensusParametersVersion,
         txs: Vec<Checked<Transaction>>,
     ) -> Vec<Result<InsertionResult, Error>> {
         // Check if that data is okay (witness match input/output, and if recovered signatures ara valid).
         // should be done before transaction comes to txpool, or before it enters RwLocked region.
         let mut res = Vec::new();
-        let view = self.database.latest_view();
+        let view = match self.database.latest_view() {
+            Ok(view) => view,
+            Err(e) => return vec![Err(Error::Other(e.to_string()))],
+        };
 
         for tx in txs.into_iter() {
-            res.push(self.insert_inner(tx, &view));
+            res.push(self.insert_inner(tx, version, &view));
         }
 
         // announce to subscribers
@@ -475,14 +473,17 @@ where
     }
 }
 
-pub async fn check_transactions<Provider>(
+pub async fn check_transactions<Provider, MP>(
     txs: &[Arc<Transaction>],
     current_height: BlockHeight,
-    config: &Config,
+    utxp_validation: bool,
+    consensus_params: &ConsensusParameters,
     gas_price_provider: &Provider,
+    memory_pool: Arc<MP>,
 ) -> Vec<Result<Checked<Transaction>, Error>>
 where
     Provider: GasPriceProvider,
+    MP: MemoryPool,
 {
     let mut checked_txs = Vec::with_capacity(txs.len());
 
@@ -491,8 +492,10 @@ where
             check_single_tx(
                 tx.deref().clone(),
                 current_height,
-                config,
+                utxp_validation,
+                consensus_params,
                 gas_price_provider,
+                memory_pool.get_memory().await,
             )
             .await,
         );
@@ -501,53 +504,54 @@ where
     checked_txs
 }
 
-pub async fn check_single_tx<GasPrice: GasPriceProvider>(
+pub async fn check_single_tx<GasPrice, M>(
     tx: Transaction,
     current_height: BlockHeight,
-    config: &Config,
+    utxo_validation: bool,
+    consensus_params: &ConsensusParameters,
     gas_price_provider: &GasPrice,
-) -> Result<Checked<Transaction>, Error> {
+    memory: M,
+) -> Result<Checked<Transaction>, Error>
+where
+    GasPrice: GasPriceProvider,
+    M: Memory + Send + Sync + 'static,
+{
     if tx.is_mint() {
         return Err(Error::NotSupportedTransactionType)
     }
 
-    let tx: Checked<Transaction> = if config.utxo_validation {
-        let consensus_params = &config.chain_config.consensus_parameters;
-
+    let tx: Checked<Transaction> = if utxo_validation {
         let tx = tx
             .into_checked_basic(current_height, consensus_params)?
-            .check_signatures(&consensus_params.chain_id)?;
+            .check_signatures(&consensus_params.chain_id())?;
 
-        let tx = tx
-            .check_predicates_async::<TokioWithRayon>(&CheckPredicateParams::from(
-                consensus_params,
-            ))
-            .await?;
+        let parameters = CheckPredicateParams::from(consensus_params);
+        let tx =
+            tokio_rayon::spawn_fifo(move || tx.check_predicates(&parameters, memory))
+                .await?;
 
         debug_assert!(tx.checks().contains(Checks::all()));
 
         tx
     } else {
-        tx.into_checked_basic(current_height, &config.chain_config.consensus_parameters)?
+        tx.into_checked_basic(current_height, consensus_params)?
     };
 
-    let gas_price = gas_price_provider
-        .gas_price(current_height)
-        .ok_or(Error::GasPriceNotFound(current_height))?;
+    let gas_price = gas_price_provider.next_gas_price().await?;
 
-    let tx = verify_tx_min_gas_price(tx, config, gas_price)?;
+    let tx = verify_tx_min_gas_price(tx, consensus_params, gas_price)?;
 
     Ok(tx)
 }
 
 fn verify_tx_min_gas_price(
     tx: Checked<Transaction>,
-    config: &Config,
+    consensus_params: &ConsensusParameters,
     gas_price: GasPrice,
 ) -> Result<Checked<Transaction>, Error> {
     let tx: CheckedTransaction = tx.into();
-    let gas_costs = &config.chain_config.consensus_parameters.gas_costs;
-    let fee_parameters = &config.chain_config.consensus_parameters.fee_params;
+    let gas_costs = consensus_params.gas_costs();
+    let fee_parameters = consensus_params.fee_params();
     let read = match tx {
         CheckedTransaction::Script(script) => {
             let ready = script.into_ready(gas_price, gas_costs, fee_parameters)?;
@@ -559,29 +563,22 @@ fn verify_tx_min_gas_price(
             let (_, checked) = ready.decompose();
             CheckedTransaction::Create(checked)
         }
+        CheckedTransaction::Upgrade(tx) => {
+            let ready = tx.into_ready(gas_price, gas_costs, fee_parameters)?;
+            let (_, checked) = ready.decompose();
+            CheckedTransaction::Upgrade(checked)
+        }
+        CheckedTransaction::Upload(tx) => {
+            let ready = tx.into_ready(gas_price, gas_costs, fee_parameters)?;
+            let (_, checked) = ready.decompose();
+            CheckedTransaction::Upload(checked)
+        }
+        CheckedTransaction::Blob(tx) => {
+            let ready = tx.into_ready(gas_price, gas_costs, fee_parameters)?;
+            let (_, checked) = ready.decompose();
+            CheckedTransaction::Blob(checked)
+        }
         CheckedTransaction::Mint(_) => return Err(Error::MintIsDisallowed),
     };
     Ok(read.into())
-}
-
-pub struct TokioWithRayon;
-
-#[async_trait::async_trait]
-impl ParallelExecutor for TokioWithRayon {
-    type Task = AsyncRayonHandle<Result<(Word, usize), PredicateVerificationFailed>>;
-
-    fn create_task<F>(func: F) -> Self::Task
-    where
-        F: FnOnce() -> Result<(Word, usize), PredicateVerificationFailed>
-            + Send
-            + 'static,
-    {
-        tokio_rayon::spawn(func)
-    }
-
-    async fn execute_tasks(
-        futures: Vec<Self::Task>,
-    ) -> Vec<Result<(Word, usize), PredicateVerificationFailed>> {
-        futures::future::join_all(futures).await
-    }
 }

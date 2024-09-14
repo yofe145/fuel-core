@@ -4,8 +4,10 @@ pub mod block_importer;
 pub mod block_producer;
 pub mod executor;
 pub mod graphql_api;
+#[cfg(feature = "std")]
 pub mod p2p;
 pub mod relayer;
+#[cfg(feature = "std")]
 pub mod txpool;
 
 // TODO: Define a one common error for all services like
@@ -13,6 +15,7 @@ pub mod txpool;
 /// The uncommitted `Result` of some action with storage changes.
 /// The user should commit the result by itself.
 #[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[must_use]
 pub struct Uncommitted<Result, Changes> {
     /// The result of the action.

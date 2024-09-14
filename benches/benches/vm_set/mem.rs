@@ -2,6 +2,7 @@ use super::run_group_ref;
 
 use crate::utils::{
     arb_dependent_cost_values,
+    linear_short,
     set_full_word,
 };
 
@@ -47,12 +48,42 @@ pub fn run(c: &mut Criterion) {
     );
 
     let linear = arb_dependent_cost_values();
+    let linear_short = linear_short();
 
-    run_group_ref(
-        &mut c.benchmark_group("cfei"),
-        "cfei",
-        VmBench::new(op::cfei(1)),
-    );
+    // cfe
+    {
+        let mut cfe = c.benchmark_group("cfe");
+
+        let mut cfe_linear = linear_short.clone();
+        cfe_linear.push(1_000_000);
+        cfe_linear.push(10_000_000);
+        cfe_linear.push(30_000_000);
+        cfe_linear.push(60_000_000);
+        for i in cfe_linear {
+            let bench =
+                VmBench::new(op::cfe(0x10)).with_prepare_script(set_full_word(0x10, i));
+            cfe.throughput(Throughput::Bytes(i));
+            run_group_ref(&mut cfe, format!("{i}"), bench);
+        }
+
+        cfe.finish();
+    }
+
+    // cfei
+    {
+        let mut cfei = c.benchmark_group("cfei");
+
+        let mut cfei_linear = linear_short.clone();
+        cfei_linear.push(1_000_000);
+        cfei_linear.push(10_000_000);
+        for i in cfei_linear {
+            let bench = VmBench::new(op::cfei(i as u32));
+            cfei.throughput(Throughput::Bytes(i));
+            run_group_ref(&mut cfei, format!("{i}"), bench);
+        }
+
+        cfei.finish();
+    }
 
     let mut mem_mcl = c.benchmark_group("mcl");
     for i in &linear {
@@ -93,6 +124,7 @@ pub fn run(c: &mut Criterion) {
             VmBench::new(op::mcp(0x10, RegId::ZERO, 0x11)).with_prepare_script(vec![
                 op::movi(0x11, *i),
                 op::aloc(0x11),
+                op::cfe(0x11),
                 op::move_(0x10, RegId::HP),
             ]),
         );
@@ -117,6 +149,7 @@ pub fn run(c: &mut Criterion) {
                 vec![
                     op::movi(0x11, *i),
                     op::aloc(0x11),
+                    op::cfe(0x11),
                     op::move_(0x10, RegId::HP),
                 ],
             ),
@@ -132,6 +165,7 @@ pub fn run(c: &mut Criterion) {
         let mut prepare_script =
             vec![op::move_(0x11, RegId::ZERO), op::move_(0x12, RegId::ZERO)];
         prepare_script.extend(set_full_word(0x13, i));
+        prepare_script.extend(vec![op::cfe(0x13)]);
 
         run_group_ref(
             &mut mem_meq,

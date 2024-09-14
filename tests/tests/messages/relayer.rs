@@ -1,5 +1,4 @@
 use super::*;
-use fuel_core::chain_config::StateReader;
 use fuel_core_types::blockchain::primitives::DaBlockHeight;
 use rand::{
     rngs::StdRng,
@@ -38,9 +37,8 @@ async fn can_submit_genesis_message() {
         ..Default::default()
     };
     let node_config = Config {
-        state_reader: StateReader::in_memory(state),
         utxo_validation: true,
-        ..Config::local_node()
+        ..Config::local_node_with_state_config(state)
     };
 
     let srv = FuelService::new_node(node_config.clone()).await.unwrap();

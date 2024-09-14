@@ -47,6 +47,8 @@ fn test_update_sender_reg() {
                 time: Tai64(0),
                 result: None,
                 receipts: vec![],
+                total_gas: 0,
+                total_fee: 0,
             }),
         ),
         Recv(0),
@@ -64,6 +66,7 @@ fn test_update_sender_reg() {
 /// # Arguments
 ///
 /// * `ops` - A vector of `Op` enums that determine the operations to be performed on the UpdateSender.
+#[allow(clippy::assigning_clones)] // Test code, we don't care about performance.
 fn test_update_sender_inner(ops: Vec<Op>) {
     // Setup runtime
     thread_local! {

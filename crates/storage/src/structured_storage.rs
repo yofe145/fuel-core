@@ -21,6 +21,7 @@ use crate::{
     kv_store::{
         BatchOperations,
         KVItem,
+        KeyItem,
         KeyValueInspect,
         KeyValueMutate,
         StorageColumn,
@@ -43,15 +44,23 @@ use crate::{
     StorageSize,
     StorageWrite,
 };
-use std::{
-    borrow::Cow,
-    ops::Deref,
-};
+use core::ops::Deref;
+
+#[cfg(feature = "std")]
+use std::borrow::Cow;
+
+#[cfg(not(feature = "std"))]
+use alloc::borrow::Cow;
+
+#[cfg(feature = "alloc")]
+use alloc::vec::Vec;
 
 pub mod balances;
+pub mod blobs;
 pub mod blocks;
 pub mod coins;
 pub mod contracts;
+
 pub mod merkle_data;
 pub mod messages;
 pub mod sealed_block;
@@ -83,6 +92,11 @@ impl<S> StructuredStorage<S> {
     /// Creates a new instance of the structured storage.
     pub fn new(storage: S) -> Self {
         Self { inner: storage }
+    }
+
+    /// Returns the inner storage.
+    pub fn into_inner(self) -> S {
+        self.inner
     }
 }
 
@@ -195,6 +209,16 @@ where
     ) -> BoxedIter<KVItem> {
         self.inner.iter_store(column, prefix, start, direction)
     }
+
+    fn iter_store_keys(
+        &self,
+        column: Self::Column,
+        prefix: Option<&[u8]>,
+        start: Option<&[u8]>,
+        direction: IterDirection,
+    ) -> BoxedIter<KeyItem> {
+        self.inner.iter_store_keys(column, prefix, start, direction)
+    }
 }
 
 impl<S> Modifiable for StructuredStorage<S>
@@ -230,7 +254,11 @@ where
     M: TableWithBlueprint<Column = Column>,
     M::Blueprint: BlueprintMutate<M, StructuredStorage<S>>,
 {
-    fn insert(
+    fn insert(&mut self, key: &M::Key, value: &M::Value) -> Result<(), Self::Error> {
+        <M as TableWithBlueprint>::Blueprint::put(self, key, M::column(), value)
+    }
+
+    fn replace(
         &mut self,
         key: &M::Key,
         value: &M::Value,
@@ -238,7 +266,11 @@ where
         <M as TableWithBlueprint>::Blueprint::replace(self, key, M::column(), value)
     }
 
-    fn remove(&mut self, key: &M::Key) -> Result<Option<M::OwnedValue>, Self::Error> {
+    fn remove(&mut self, key: &M::Key) -> Result<(), Self::Error> {
+        <M as TableWithBlueprint>::Blueprint::delete(self, key, M::column())
+    }
+
+    fn take(&mut self, key: &M::Key) -> Result<Option<M::OwnedValue>, Self::Error> {
         <M as TableWithBlueprint>::Blueprint::take(self, key, M::column())
     }
 }
@@ -343,12 +375,12 @@ where
     //  without deserialization into `OwnedValue`.
     M::OwnedValue: Into<Vec<u8>>,
 {
-    fn write(&mut self, key: &M::Key, buf: &[u8]) -> Result<usize, Self::Error> {
+    fn write_bytes(&mut self, key: &M::Key, buf: &[u8]) -> Result<usize, Self::Error> {
         <M as TableWithBlueprint>::Blueprint::put(self, key, M::column(), buf)
             .map(|_| buf.len())
     }
 
-    fn replace(
+    fn replace_bytes(
         &mut self,
         key: &M::Key,
         buf: &[u8],
@@ -361,7 +393,7 @@ where
         Ok(result)
     }
 
-    fn take(&mut self, key: &M::Key) -> Result<Option<Vec<u8>>, Self::Error> {
+    fn take_bytes(&mut self, key: &M::Key) -> Result<Option<Vec<u8>>, Self::Error> {
         let take = <M as TableWithBlueprint>::Blueprint::take(self, key, M::column())?
             .map(|value| value.into());
         Ok(take)
@@ -385,7 +417,7 @@ pub mod test {
     type Storage = HashMap<(u32, Vec<u8>), Value>;
 
     /// The in-memory storage for testing purposes.
-    #[derive(Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct InMemoryStorage<Column> {
         pub(crate) storage: Storage,
         _marker: core::marker::PhantomData<Column>,

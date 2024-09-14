@@ -1,4 +1,4 @@
-//! Clap configuration related to consensus parameters
+//! Clap configuration related to TxPool service.
 
 use fuel_core::txpool::types::ContractId;
 use fuel_core_types::{
@@ -73,8 +73,8 @@ mod tests {
         ]
         => Ok(blacklist(vec![[0; 32].into(), [1; 32].into()], vec![], vec![], vec![])); "addresses works")]
     #[test_case(&["", "--tx-blacklist-coins=\
-            0x000000000000000000000000000000000000000000000000000000000000000002,\
-            010101010101010101010101010101010101010101010101010101010101010103"
+            0x00000000000000000000000000000000000000000000000000000000000000000002,\
+            01010101010101010101010101010101010101010101010101010101010101010003"
     ]
     => Ok(blacklist(vec![], vec![UtxoId::new([0; 32].into(), 2), UtxoId::new([1; 32].into(), 3)], vec![], vec![])); "coins works")]
     #[test_case(&["", "--tx-blacklist-messages=\

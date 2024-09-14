@@ -66,24 +66,19 @@ impl SpendQuery {
         exclude_vec: Option<Vec<CoinId>>,
         base_asset_id: AssetId,
     ) -> Result<Self, CoinsQueryError> {
-        let mut duplicate_checker = HashSet::new();
+        let mut duplicate_checker = HashSet::with_capacity(query_per_asset.len());
 
         for query in query_per_asset {
-            if duplicate_checker.contains(&query.id) {
-                return Err(CoinsQueryError::DuplicateAssets(query.id))
+            if !duplicate_checker.insert(query.id) {
+                return Err(CoinsQueryError::DuplicateAssets(query.id));
             }
-            duplicate_checker.insert(query.id);
         }
 
-        let exclude = if let Some(exclude_vec) = exclude_vec {
-            Exclude::new(exclude_vec)
-        } else {
-            Default::default()
-        };
+        let exclude = exclude_vec.map_or_else(Default::default, Exclude::new);
 
         Ok(Self {
             owner,
-            query_per_asset: query_per_asset.into(),
+            query_per_asset: query_per_asset.to_vec(),
             exclude,
             base_asset_id,
         })
@@ -263,7 +258,7 @@ mod tests {
                 Coin,
                 CompressedCoin,
             },
-            message::{
+            relayer::message::{
                 Message,
                 MessageV1,
             },
@@ -343,7 +338,7 @@ mod tests {
                         asset,
                         base_asset_id,
                         None,
-                        &db.view(),
+                        &db.test_view(),
                     ))
                     .map(|coins| {
                         coins
@@ -503,7 +498,7 @@ mod tests {
             db: &ServiceDatabase,
         ) -> Result<Vec<(AssetId, u64)>, CoinsQueryError> {
             let coins = random_improve(
-                &db.view(),
+                &db.test_view(),
                 &SpendQuery::new(owner, &query_per_asset, None, base_asset_id)?,
             );
 
@@ -701,7 +696,8 @@ mod tests {
                     Some(excluded_ids),
                     base_asset_id,
                 )?;
-                let coins = random_improve(&db.service_database().view(), &spend_query);
+                let coins =
+                    random_improve(&db.service_database().test_view(), &spend_query);
 
                 // Transform result for convenience
                 coins.map(|coins| {
@@ -859,7 +855,7 @@ mod tests {
         }
 
         let coins = random_improve(
-            &db.service_database().view(),
+            &db.service_database().test_view(),
             &SpendQuery::new(
                 owner,
                 &[AssetSpendTarget {
@@ -952,7 +948,7 @@ mod tests {
         fn service_database(&self) -> ServiceDatabase {
             let on_chain = self.database.on_chain().clone();
             let off_chain = self.database.off_chain().clone();
-            ServiceDatabase::new(on_chain, off_chain)
+            ServiceDatabase::new(0u32.into(), on_chain, off_chain)
         }
     }
 
@@ -1008,7 +1004,7 @@ mod tests {
         pub fn owned_coins(&self, owner: &Address) -> Vec<Coin> {
             use crate::query::CoinQueryData;
             let query = self.service_database();
-            let query = query.view();
+            let query = query.test_view();
             query
                 .owned_coins_ids(owner, None, IterDirection::Forward)
                 .map(|res| res.map(|id| query.coin(id).unwrap()))
@@ -1019,7 +1015,7 @@ mod tests {
         pub fn owned_messages(&self, owner: &Address) -> Vec<Message> {
             use crate::query::MessageQueryData;
             let query = self.service_database();
-            let query = query.view();
+            let query = query.test_view();
             query
                 .owned_message_ids(owner, None, IterDirection::Forward)
                 .map(|res| res.map(|id| query.message(&id).unwrap()))

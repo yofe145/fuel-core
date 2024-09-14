@@ -1,5 +1,9 @@
 use crate::{
-    database::Database,
+    database::{
+        database_description::on_chain::OnChain,
+        Database,
+        OnChainIterableKeyValueView,
+    },
     fuel_core_graphql_api::ports::{
         DatabaseBlocks,
         DatabaseChain,
@@ -7,8 +11,8 @@ use crate::{
         DatabaseMessages,
         OnChainDatabase,
     },
+    graphql_api::ports::worker,
 };
-use fuel_core_importer::ports::ImporterDatabase;
 use fuel_core_storage::{
     iter::{
         BoxedIter,
@@ -17,26 +21,57 @@ use fuel_core_storage::{
         IteratorOverTable,
     },
     not_found,
-    tables::FuelBlocks,
+    tables::{
+        FuelBlocks,
+        SealedBlockConsensus,
+        Transactions,
+    },
     Error as StorageError,
     Result as StorageResult,
+    StorageAsRef,
 };
-use fuel_core_txpool::types::ContractId;
+use fuel_core_txpool::types::{
+    ContractId,
+    TxId,
+};
 use fuel_core_types::{
     blockchain::{
         block::CompressedBlock,
+        consensus::Consensus,
         primitives::DaBlockHeight,
     },
-    entities::message::Message,
-    fuel_tx::AssetId,
+    entities::relayer::message::Message,
+    fuel_tx::{
+        AssetId,
+        Transaction,
+    },
     fuel_types::{
         BlockHeight,
         Nonce,
     },
     services::graphql_api::ContractBalance,
 };
+use itertools::Itertools;
 
-impl DatabaseBlocks for Database {
+impl DatabaseBlocks for OnChainIterableKeyValueView {
+    fn transaction(&self, tx_id: &TxId) -> StorageResult<Transaction> {
+        Ok(self
+            .storage::<Transactions>()
+            .get(tx_id)?
+            .ok_or(not_found!(Transactions))?
+            .into_owned())
+    }
+
+    fn block(&self, height: &BlockHeight) -> StorageResult<CompressedBlock> {
+        let block = self
+            .storage_as_ref::<FuelBlocks>()
+            .get(height)?
+            .ok_or_else(|| not_found!(FuelBlocks))?
+            .into_owned();
+
+        Ok(block)
+    }
+
     fn blocks(
         &self,
         height: Option<BlockHeight>,
@@ -48,13 +83,18 @@ impl DatabaseBlocks for Database {
     }
 
     fn latest_height(&self) -> StorageResult<BlockHeight> {
-        self.latest_block_height()
-            .transpose()
-            .ok_or(not_found!("BlockHeight"))?
+        self.latest_height()
+    }
+
+    fn consensus(&self, id: &BlockHeight) -> StorageResult<Consensus> {
+        self.storage_as_ref::<SealedBlockConsensus>()
+            .get(id)
+            .map(|c| c.map(|c| c.into_owned()))?
+            .ok_or(not_found!(SealedBlockConsensus))
     }
 }
 
-impl DatabaseMessages for Database {
+impl DatabaseMessages for OnChainIterableKeyValueView {
     fn all_messages(
         &self,
         start_message_id: Option<Nonce>,
@@ -65,37 +105,30 @@ impl DatabaseMessages for Database {
             .into_boxed()
     }
 
-    fn message_is_spent(&self, nonce: &Nonce) -> StorageResult<bool> {
-        self.message_is_spent(nonce)
-    }
-
     fn message_exists(&self, nonce: &Nonce) -> StorageResult<bool> {
         self.message_exists(nonce)
     }
 }
 
-impl DatabaseContracts for Database {
+impl DatabaseContracts for OnChainIterableKeyValueView {
     fn contract_balances(
         &self,
         contract: ContractId,
         start_asset: Option<AssetId>,
         direction: IterDirection,
     ) -> BoxedIter<StorageResult<ContractBalance>> {
-        self.contract_balances(contract, start_asset, Some(direction))
-            .map(move |result| {
-                result
-                    .map_err(StorageError::from)
-                    .map(|(asset_id, amount)| ContractBalance {
-                        owner: contract,
-                        amount,
-                        asset_id,
-                    })
+        self.filter_contract_balances(contract, start_asset, Some(direction))
+            .map_ok(|entry| ContractBalance {
+                owner: *entry.key.contract_id(),
+                amount: entry.value,
+                asset_id: *entry.key.asset_id(),
             })
+            .map(|res| res.map_err(StorageError::from))
             .into_boxed()
     }
 }
 
-impl DatabaseChain for Database {
+impl DatabaseChain for OnChainIterableKeyValueView {
     fn da_height(&self) -> StorageResult<DaBlockHeight> {
         self.latest_compressed_block()?
             .map(|block| block.header().da_height)
@@ -103,4 +136,10 @@ impl DatabaseChain for Database {
     }
 }
 
-impl OnChainDatabase for Database {}
+impl OnChainDatabase for OnChainIterableKeyValueView {}
+
+impl worker::OnChainDatabase for Database<OnChain> {
+    fn latest_height(&self) -> StorageResult<Option<BlockHeight>> {
+        Ok(fuel_core_storage::transactional::HistoricalView::latest_height(self))
+    }
+}

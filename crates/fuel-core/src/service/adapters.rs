@@ -1,29 +1,49 @@
+use fuel_core_consensus_module::{
+    block_verifier::Verifier,
+    RelayerConsensusConfig,
+};
+use fuel_core_importer::ImporterResult;
+use fuel_core_poa::{
+    ports::BlockSigner,
+    signer::SignMode,
+};
+use fuel_core_services::stream::BoxStream;
+#[cfg(feature = "p2p")]
+use fuel_core_types::services::p2p::peer_reputation::AppScore;
+use fuel_core_types::{
+    blockchain::{
+        block::Block,
+        consensus::Consensus,
+    },
+    fuel_types::BlockHeight,
+    services::block_importer::SharedImportResult,
+    tai64::Tai64,
+};
+use fuel_core_upgradable_executor::executor::Executor;
+use std::sync::Arc;
+
 use crate::{
     database::{
         database_description::relayer::Relayer,
         Database,
     },
-    service::sub_services::BlockProducerService,
+    service::{
+        sub_services::{
+            BlockProducerService,
+            TxPoolSharedState,
+        },
+        vm_pool::MemoryPool,
+    },
 };
-use fuel_core_consensus_module::{
-    block_verifier::Verifier,
-    RelayerConsensusConfig,
-};
-use fuel_core_executor::executor::Executor;
-use fuel_core_services::stream::BoxStream;
-use fuel_core_txpool::service::SharedState as TxPoolSharedState;
-#[cfg(feature = "p2p")]
-use fuel_core_types::services::p2p::peer_reputation::AppScore;
-use fuel_core_types::{
-    fuel_types::BlockHeight,
-    services::block_importer::SharedImportResult,
-};
-use std::sync::Arc;
 
 pub mod block_importer;
 pub mod consensus_module;
+pub mod consensus_parameters_provider;
 pub mod executor;
+pub mod fuel_gas_price_provider;
+pub mod gas_price_adapters;
 pub mod graphql_api;
+pub mod import_result_provider;
 #[cfg(feature = "p2p")]
 pub mod p2p;
 pub mod producer;
@@ -32,6 +52,17 @@ pub mod relayer;
 #[cfg(feature = "p2p")]
 pub mod sync;
 pub mod txpool;
+
+#[derive(Debug, Clone)]
+pub struct ConsensusParametersProvider {
+    shared_state: consensus_parameters_provider::SharedState,
+}
+
+impl ConsensusParametersProvider {
+    pub fn new(shared_state: consensus_parameters_provider::SharedState) -> Self {
+        Self { shared_state }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct StaticGasPrice {
@@ -51,26 +82,23 @@ pub struct PoAAdapter {
 
 #[derive(Clone)]
 pub struct TxPoolAdapter {
-    service: TxPoolSharedState<P2PAdapter, Database, StaticGasPrice>,
+    service: TxPoolSharedState,
 }
 
 impl TxPoolAdapter {
-    pub fn new(service: TxPoolSharedState<P2PAdapter, Database, StaticGasPrice>) -> Self {
+    pub fn new(service: TxPoolSharedState) -> Self {
         Self { service }
     }
 }
 
 #[derive(Clone)]
 pub struct TransactionsSource {
-    txpool: TxPoolSharedState<P2PAdapter, Database, StaticGasPrice>,
+    txpool: TxPoolSharedState,
     _block_height: BlockHeight,
 }
 
 impl TransactionsSource {
-    pub fn new(
-        txpool: TxPoolSharedState<P2PAdapter, Database, StaticGasPrice>,
-        block_height: BlockHeight,
-    ) -> Self {
+    pub fn new(txpool: TxPoolSharedState, block_height: BlockHeight) -> Self {
         Self {
             txpool,
             _block_height: block_height,
@@ -87,13 +115,9 @@ impl ExecutorAdapter {
     pub fn new(
         database: Database,
         relayer_database: Database<Relayer>,
-        config: fuel_core_executor::Config,
+        config: fuel_core_upgradable_executor::config::Config,
     ) -> Self {
-        let executor = Executor {
-            database_view_provider: database,
-            relayer_view_provider: relayer_database,
-            config: Arc::new(config),
-        };
+        let executor = Executor::new(database, relayer_database, config);
         Self {
             executor: Arc::new(executor),
         }
@@ -146,12 +170,41 @@ pub struct BlockImporterAdapter {
 }
 
 impl BlockImporterAdapter {
-    pub fn events(&self) -> BoxStream<SharedImportResult> {
+    pub fn events(&self) -> BoxStream<ImporterResult> {
         use futures::StreamExt;
         fuel_core_services::stream::IntoBoxStream::into_boxed(
             tokio_stream::wrappers::BroadcastStream::new(self.block_importer.subscribe())
                 .filter_map(|r| futures::future::ready(r.ok())),
         )
+    }
+
+    pub fn events_shared_result(&self) -> BoxStream<SharedImportResult> {
+        use futures::StreamExt;
+        fuel_core_services::stream::IntoBoxStream::into_boxed(
+            tokio_stream::wrappers::BroadcastStream::new(self.block_importer.subscribe())
+                .filter_map(|r| futures::future::ready(r.ok()))
+                .map(|r| r.shared_result),
+        )
+    }
+}
+
+pub struct FuelBlockSigner {
+    mode: SignMode,
+}
+impl FuelBlockSigner {
+    pub fn new(mode: SignMode) -> Self {
+        Self { mode }
+    }
+}
+
+#[async_trait::async_trait]
+impl BlockSigner for FuelBlockSigner {
+    async fn seal_block(&self, block: &Block) -> anyhow::Result<Consensus> {
+        self.mode.seal_block(block).await
+    }
+
+    fn is_available(&self) -> bool {
+        self.mode.is_available()
     }
 }
 
@@ -193,5 +246,26 @@ impl P2PAdapter {
 impl P2PAdapter {
     pub fn new() -> Self {
         Default::default()
+    }
+}
+
+#[derive(Clone)]
+pub struct SharedMemoryPool {
+    memory_pool: MemoryPool,
+}
+
+impl SharedMemoryPool {
+    pub fn new(number_of_instances: usize) -> Self {
+        Self {
+            memory_pool: MemoryPool::new(number_of_instances),
+        }
+    }
+}
+
+pub struct SystemTime;
+
+impl fuel_core_poa::ports::GetTime for SystemTime {
+    fn now(&self) -> Tai64 {
+        Tai64::now()
     }
 }

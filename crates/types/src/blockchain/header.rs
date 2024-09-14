@@ -10,6 +10,7 @@ use super::{
 };
 use crate::{
     fuel_merkle,
+    fuel_merkle::binary::root_calculator::MerkleRootCalculator,
     fuel_tx::Transaction,
     fuel_types::{
         canonical::Serialize,
@@ -24,7 +25,6 @@ use tai64::Tai64;
 #[derive(Clone, Debug, derivative::Derivative)]
 #[derivative(PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[non_exhaustive]
 pub enum BlockHeader {
     /// V1 BlockHeader
     V1(BlockHeaderV1),
@@ -75,8 +75,7 @@ impl BlockHeader {
         }
     }
 
-    /// Mutable getter for consensus portion of header
-    fn consensus_mut(&mut self) -> &mut ConsensusHeader<GeneratedConsensusFields> {
+    fn _consensus_mut(&mut self) -> &mut ConsensusHeader<GeneratedConsensusFields> {
         match self {
             BlockHeader::V1(v1) => &mut v1.consensus,
         }
@@ -85,6 +84,10 @@ impl BlockHeader {
 
 #[cfg(feature = "test-helpers")]
 impl BlockHeader {
+    /// Mutable getter for consensus portion of header
+    pub fn consensus_mut(&mut self) -> &mut ConsensusHeader<GeneratedConsensusFields> {
+        self._consensus_mut()
+    }
     /// Set the entire consensus header
     pub fn set_consensus_header(
         &mut self,
@@ -145,9 +148,10 @@ impl BlockHeader {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(any(test, feature = "test-helpers"), derive(Default))]
-/// A partially complete fuel block header that doesn't not
+/// A partially complete fuel block header that does not
 /// have any generated fields because it has not been executed yet.
 pub struct PartialBlockHeader {
     /// The application header.
@@ -161,9 +165,11 @@ pub type ConsensusParametersVersion = u32;
 /// The type representing the version of the state transition bytecode.
 pub type StateTransitionBytecodeVersion = u32;
 
+/// The latest version of the state transition bytecode.
+pub const LATEST_STATE_TRANSITION_VERSION: StateTransitionBytecodeVersion = 10;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(any(test, feature = "test-helpers"), derive(Default))]
 /// The fuel block application header.
 /// Contains everything except consensus related data.
 pub struct ApplicationHeader<Generated> {
@@ -182,6 +188,21 @@ pub struct ApplicationHeader<Generated> {
     pub generated: Generated,
 }
 
+#[cfg(any(test, feature = "test-helpers"))]
+impl<Generated> Default for ApplicationHeader<Generated>
+where
+    Generated: Default,
+{
+    fn default() -> Self {
+        Self {
+            da_height: Default::default(),
+            consensus_parameters_version: Default::default(),
+            state_transition_bytecode_version: LATEST_STATE_TRANSITION_VERSION,
+            generated: Default::default(),
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(any(test, feature = "test-helpers"), derive(Default))]
@@ -189,13 +210,15 @@ pub struct ApplicationHeader<Generated> {
 /// These are generated once the full block has been run.
 pub struct GeneratedApplicationFields {
     /// Number of transactions in this block.
-    pub transactions_count: u64,
+    pub transactions_count: u16,
     /// Number of message receipts in this block.
-    pub message_receipt_count: u64,
+    pub message_receipt_count: u32,
     /// Merkle root of transactions.
     pub transactions_root: Bytes32,
     /// Merkle root of message receipts in this block.
-    pub message_receipt_root: Bytes32,
+    pub message_outbox_root: Bytes32,
+    /// Root hash of all imported events from L1
+    pub event_inbox_root: Bytes32,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -303,12 +326,37 @@ impl PartialBlockHeader {
         ConsensusType::PoA
     }
 }
+impl From<&BlockHeader> for PartialBlockHeader {
+    fn from(header: &BlockHeader) -> Self {
+        let ConsensusHeader {
+            prev_root,
+            height,
+            time,
+            ..
+        } = *header.consensus();
+        PartialBlockHeader {
+            application: ApplicationHeader {
+                da_height: header.da_height,
+                consensus_parameters_version: header.consensus_parameters_version,
+                state_transition_bytecode_version: header
+                    .state_transition_bytecode_version,
+                generated: Empty {},
+            },
+            consensus: ConsensusHeader {
+                prev_root,
+                height,
+                time,
+                generated: Empty {},
+            },
+        }
+    }
+}
 
 impl BlockHeader {
     /// Re-generate the header metadata.
     pub fn recalculate_metadata(&mut self) {
         let application_hash = self.application().hash();
-        self.consensus_mut().generated.application_hash = application_hash;
+        self._consensus_mut().generated.application_hash = application_hash;
         let id = self.hash();
         match self {
             BlockHeader::V1(v1) => {
@@ -344,8 +392,19 @@ impl BlockHeader {
         let transactions_root = generate_txns_root(transactions);
 
         transactions_root == self.application().transactions_root
-            && transactions.len() as u64 == self.application().transactions_count
+            && transactions.len() == self.application().transactions_count as usize
     }
+}
+
+/// Error type for generating a full [`BlockHeader`] from a [`PartialBlockHeader`].
+#[derive(derive_more::Display, Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[allow(missing_docs)]
+pub enum BlockHeaderError {
+    #[display(fmt = "The block header has too many transactions to fit into the `u16`")]
+    TooManyTransactions,
+    #[display(fmt = "The block header has too many messages to fit into the `u32`")]
+    TooManyMessages,
 }
 
 impl PartialBlockHeader {
@@ -364,18 +423,21 @@ impl PartialBlockHeader {
     pub fn generate(
         self,
         transactions: &[Transaction],
-        message_ids: &[MessageId],
-    ) -> BlockHeader {
+        outbox_message_ids: &[MessageId],
+        event_inbox_root: Bytes32,
+    ) -> Result<BlockHeader, BlockHeaderError> {
         // Generate the transaction merkle root.
         let transactions_root = generate_txns_root(transactions);
 
         // Generate the message merkle root.
-        let mut message_tree =
-            fuel_merkle::binary::root_calculator::MerkleRootCalculator::new();
-        for id in message_ids {
-            message_tree.push(id.as_ref());
-        }
-        let message_receipt_root = message_tree.root().into();
+        let message_outbox_root = outbox_message_ids
+            .iter()
+            .fold(MerkleRootCalculator::new(), |mut tree, id| {
+                tree.push(id.as_ref());
+                tree
+            })
+            .root()
+            .into();
 
         let application = ApplicationHeader {
             da_height: self.application.da_height,
@@ -384,10 +446,13 @@ impl PartialBlockHeader {
                 .application
                 .state_transition_bytecode_version,
             generated: GeneratedApplicationFields {
-                transactions_count: transactions.len() as u64,
-                message_receipt_count: message_ids.len() as u64,
+                transactions_count: u16::try_from(transactions.len())
+                    .map_err(|_| BlockHeaderError::TooManyTransactions)?,
+                message_receipt_count: u32::try_from(outbox_message_ids.len())
+                    .map_err(|_| BlockHeaderError::TooManyMessages)?,
                 transactions_root,
-                message_receipt_root,
+                message_outbox_root,
+                event_inbox_root,
             },
         };
 
@@ -408,7 +473,7 @@ impl PartialBlockHeader {
 
         // Cache the hash.
         header.recalculate_metadata();
-        header
+        Ok(header)
     }
 }
 
@@ -428,13 +493,30 @@ impl ApplicationHeader<GeneratedApplicationFields> {
     pub fn hash(&self) -> Bytes32 {
         // Order matters and is the same as the spec.
         let mut hasher = crate::fuel_crypto::Hasher::default();
-        hasher.input(self.da_height.to_bytes().as_slice());
-        hasher.input(self.transactions_count.to_be_bytes());
-        hasher.input(self.message_receipt_count.to_be_bytes());
-        hasher.input(self.transactions_root.as_ref());
-        hasher.input(self.message_receipt_root.as_ref());
-        hasher.input(self.consensus_parameters_version.to_bytes().as_slice());
-        hasher.input(self.state_transition_bytecode_version.to_bytes().as_slice());
+        let Self {
+            da_height,
+            consensus_parameters_version,
+            state_transition_bytecode_version,
+            generated:
+                GeneratedApplicationFields {
+                    transactions_count,
+                    message_receipt_count,
+                    transactions_root,
+                    message_outbox_root,
+                    event_inbox_root,
+                },
+        } = self;
+
+        hasher.input(da_height.to_be_bytes());
+        hasher.input(consensus_parameters_version.to_be_bytes());
+        hasher.input(state_transition_bytecode_version.to_be_bytes());
+
+        hasher.input(transactions_count.to_be_bytes());
+        hasher.input(message_receipt_count.to_be_bytes());
+        hasher.input(transactions_root.as_ref());
+        hasher.input(message_outbox_root.as_ref());
+        hasher.input(event_inbox_root.as_ref());
+
         hasher.digest()
     }
 }
@@ -444,10 +526,19 @@ impl ConsensusHeader<GeneratedConsensusFields> {
     pub fn hash(&self) -> BlockId {
         // Order matters and is the same as the spec.
         let mut hasher = crate::fuel_crypto::Hasher::default();
-        hasher.input(self.prev_root.as_ref());
-        hasher.input(&self.height.to_bytes()[..]);
-        hasher.input(self.time.0.to_be_bytes());
-        hasher.input(self.application_hash.as_ref());
+        let Self {
+            prev_root,
+            height,
+            time,
+            generated: GeneratedConsensusFields { application_hash },
+        } = self;
+
+        hasher.input(prev_root.as_ref());
+        hasher.input(height.to_be_bytes());
+        hasher.input(time.0.to_be_bytes());
+
+        hasher.input(application_hash.as_ref());
+
         BlockId::from(hasher.digest())
     }
 }

@@ -1,13 +1,16 @@
 use crate::{
     fuel_core_graphql_api::{
-        database::ReadView,
-        Config,
+        api_service::ConsensusProvider,
+        QUERY_COSTS,
     },
     query::BalanceQueryData,
-    schema::scalars::{
-        Address,
-        AssetId,
-        U64,
+    schema::{
+        scalars::{
+            Address,
+            AssetId,
+            U64,
+        },
+        ReadViewProvider,
     },
 };
 use anyhow::anyhow;
@@ -50,25 +53,25 @@ pub struct BalanceQuery;
 
 #[Object]
 impl BalanceQuery {
+    #[graphql(complexity = "QUERY_COSTS.balance_query")]
     async fn balance(
         &self,
         ctx: &Context<'_>,
         #[graphql(desc = "address of the owner")] owner: Address,
         #[graphql(desc = "asset_id of the coin")] asset_id: AssetId,
     ) -> async_graphql::Result<Balance> {
-        let query: &ReadView = ctx.data_unchecked();
+        let query = ctx.read_view()?;
         let base_asset_id = *ctx
-            .data_unchecked::<Config>()
-            .consensus_parameters
+            .data_unchecked::<ConsensusProvider>()
+            .latest_consensus_params()
             .base_asset_id();
         let balance = query.balance(owner.0, asset_id.0, base_asset_id)?.into();
         Ok(balance)
     }
 
-    // TODO: We can't paginate over `AssetId` because it is not unique.
-    //  It should be replaced with `UtxoId`.
-    //  This API should be migrated to the indexer for better support and
+    // TODO: This API should be migrated to the indexer for better support and
     //  discontinued within fuel-core.
+    #[graphql(complexity = "QUERY_COSTS.balance_query")]
     async fn balances(
         &self,
         ctx: &Context<'_>,
@@ -82,12 +85,12 @@ impl BalanceQuery {
         if before.is_some() || after.is_some() {
             return Err(anyhow!("pagination is not yet supported").into())
         }
-        let query: &ReadView = ctx.data_unchecked();
+        let query = ctx.read_view()?;
         crate::schema::query_pagination(after, before, first, last, |_, direction| {
             let owner = filter.owner.into();
             let base_asset_id = *ctx
-                .data_unchecked::<Config>()
-                .consensus_parameters
+                .data_unchecked::<ConsensusProvider>()
+                .latest_consensus_params()
                 .base_asset_id();
             Ok(query
                 .balances(owner, direction, base_asset_id)

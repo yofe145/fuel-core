@@ -30,7 +30,8 @@ impl FuelService {
             .insert(vec![Arc::new(tx)])
             .await
             .into_iter()
-            .collect::<Result<_, _>>()?;
+            .collect::<Result<_, _>>()
+            .map_err(|e| anyhow::anyhow!(e))?;
         results
             .into_iter()
             .next()
@@ -45,9 +46,10 @@ impl FuelService {
         let id = tx.id(&self
             .shared
             .config
-            .chain_config
+            .snapshot_reader
+            .chain_config()
             .consensus_parameters
-            .chain_id);
+            .chain_id());
         let stream = self.transaction_status_change(id)?;
         self.submit(tx).await?;
         Ok(stream)
@@ -61,9 +63,10 @@ impl FuelService {
         let id = tx.id(&self
             .shared
             .config
-            .chain_config
+            .snapshot_reader
+            .chain_config()
             .consensus_parameters
-            .chain_id);
+            .chain_id());
         let stream = self.transaction_status_change(id)?.filter(|status| {
             futures::future::ready(!matches!(status, Ok(TransactionStatus::Submitted(_))))
         });
@@ -81,7 +84,7 @@ impl FuelService {
         id: Bytes32,
     ) -> anyhow::Result<impl Stream<Item = anyhow::Result<TransactionStatus>>> {
         let txpool = self.shared.txpool_shared_state.clone();
-        let db = self.shared.database.off_chain().clone();
+        let db = self.shared.database.off_chain().latest_view()?;
         let rx = txpool.tx_update_subscribe(id)?;
         Ok(transaction_status_change(
             move |id| match db.get_tx_status(&id)? {

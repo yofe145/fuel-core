@@ -14,10 +14,7 @@ query($after: String, $before: String, $first: Int, $last: Int) {
             time
           }
           ... on SuccessStatus {
-            transactionId
-            block {
-              height
-            }
+            blockHeight
             time
             programState {
               returnType
@@ -53,15 +50,14 @@ query($after: String, $before: String, $first: Int, $last: Int) {
               contractId
               subId
             }
+            totalGas
+            totalFee
           }
           ... on SqueezedOutStatus {
             reason
           }
           ... on FailureStatus {
-            transactionId
-            block {
-              height
-            }
+            blockHeight
             time
             reason
             programState {
@@ -98,6 +94,8 @@ query($after: String, $before: String, $first: Int, $last: Int) {
               contractId
               subId
             }
+            totalGas
+            totalFee
           }
         }
       }
@@ -110,5 +108,3 @@ query($after: String, $before: String, $first: Int, $last: Int) {
     }
   }
 }
-
-

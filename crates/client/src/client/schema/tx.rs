@@ -1,4 +1,3 @@
-use super::block::BlockHeightFragment;
 use crate::client::{
     schema::{
         schema,
@@ -10,6 +9,8 @@ use crate::client::{
         PageInfo,
         Tai64Timestamp,
         TransactionId,
+        U32,
+        U64,
     },
     types::TransactionResponse,
     PageDirection,
@@ -50,7 +51,19 @@ pub struct TxIdArgs {
 )]
 pub struct TransactionQuery {
     #[arguments(id: $id)]
-    pub transaction: Option<OpaqueTransaction>,
+    pub transaction: Option<OpaqueTransactionWithStatus>,
+}
+
+/// Retrieves the transaction in opaque form
+#[derive(cynic::QueryFragment, Clone, Debug)]
+#[cynic(
+    schema_path = "./assets/schema.sdl",
+    graphql_type = "Query",
+    variables = "TxIdArgs"
+)]
+pub struct TransactionStatusQuery {
+    #[arguments(id: $id)]
+    pub transaction: Option<OpaqueTransactionStatus>,
 }
 
 #[derive(cynic::QueryFragment, Clone, Debug)]
@@ -91,13 +104,25 @@ impl TryFrom<TransactionConnection> for PaginatedResult<TransactionResponse, Str
 #[cynic(schema_path = "./assets/schema.sdl")]
 pub struct TransactionEdge {
     pub cursor: String,
-    pub node: OpaqueTransaction,
+    pub node: OpaqueTransactionWithStatus,
 }
 
 #[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(graphql_type = "Transaction", schema_path = "./assets/schema.sdl")]
 pub struct OpaqueTransaction {
     pub raw_payload: HexString,
+}
+
+#[derive(cynic::QueryFragment, Clone, Debug)]
+#[cynic(graphql_type = "Transaction", schema_path = "./assets/schema.sdl")]
+pub struct OpaqueTransactionWithStatus {
+    pub raw_payload: HexString,
+    pub status: Option<TransactionStatus>,
+}
+
+#[derive(cynic::QueryFragment, Clone, Debug)]
+#[cynic(graphql_type = "Transaction", schema_path = "./assets/schema.sdl")]
+pub struct OpaqueTransactionStatus {
     pub status: Option<TransactionStatus>,
 }
 
@@ -177,22 +202,28 @@ pub struct SubmittedStatus {
 #[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(schema_path = "./assets/schema.sdl")]
 pub struct SuccessStatus {
-    pub transaction_id: TransactionId,
-    pub block: BlockHeightFragment,
+    #[cfg(feature = "test-helpers")]
+    pub transaction: OpaqueTransaction,
+    pub block_height: U32,
     pub time: Tai64Timestamp,
     pub program_state: Option<ProgramState>,
     pub receipts: Vec<Receipt>,
+    pub total_gas: U64,
+    pub total_fee: U64,
 }
 
 #[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(schema_path = "./assets/schema.sdl")]
 pub struct FailureStatus {
-    pub transaction_id: TransactionId,
-    pub block: BlockHeightFragment,
+    #[cfg(feature = "test-helpers")]
+    pub transaction: OpaqueTransaction,
+    pub block_height: U32,
     pub time: Tai64Timestamp,
     pub reason: String,
     pub program_state: Option<ProgramState>,
     pub receipts: Vec<Receipt>,
+    pub total_gas: U64,
+    pub total_fee: U64,
 }
 
 #[derive(cynic::QueryFragment, Clone, Debug)]
@@ -225,6 +256,8 @@ impl TryFrom<DryRunTransactionStatus> for TransactionExecutionResult {
                 TransactionExecutionResult::Success {
                     result: s.program_state.map(TryInto::try_into).transpose()?,
                     receipts,
+                    total_gas: s.total_gas.0,
+                    total_fee: s.total_fee.0,
                 }
             }
             DryRunTransactionStatus::FailureStatus(s) => {
@@ -236,6 +269,8 @@ impl TryFrom<DryRunTransactionStatus> for TransactionExecutionResult {
                 TransactionExecutionResult::Failed {
                     result: s.program_state.map(TryInto::try_into).transpose()?,
                     receipts,
+                    total_gas: s.total_gas.0,
+                    total_fee: s.total_fee.0,
                 }
             }
             DryRunTransactionStatus::Unknown => {
@@ -250,6 +285,8 @@ impl TryFrom<DryRunTransactionStatus> for TransactionExecutionResult {
 pub struct DryRunSuccessStatus {
     pub program_state: Option<ProgramState>,
     pub receipts: Vec<Receipt>,
+    pub total_gas: U64,
+    pub total_fee: U64,
 }
 
 #[derive(cynic::QueryFragment, Clone, Debug)]
@@ -257,6 +294,8 @@ pub struct DryRunSuccessStatus {
 pub struct DryRunFailureStatus {
     pub program_state: Option<ProgramState>,
     pub receipts: Vec<Receipt>,
+    pub total_gas: U64,
+    pub total_fee: U64,
 }
 
 #[derive(cynic::QueryFragment, Clone, Debug)]
@@ -357,6 +396,7 @@ pub struct EstimatePredicates {
 pub struct DryRunArg {
     pub txs: Vec<HexString>,
     pub utxo_validation: Option<bool>,
+    pub gas_price: Option<U64>,
 }
 
 #[derive(cynic::QueryFragment, Clone, Debug)]
@@ -366,7 +406,7 @@ pub struct DryRunArg {
     variables = "DryRunArg"
 )]
 pub struct DryRun {
-    #[arguments(txs: $txs, utxoValidation: $utxo_validation)]
+    #[arguments(txs: $txs, utxoValidation: $utxo_validation, gasPrice: $gas_price)]
     pub dry_run: Vec<DryRunTransactionExecutionStatus>,
 }
 
@@ -393,6 +433,17 @@ pub struct SubmitAndAwaitSubscription {
 }
 
 #[derive(cynic::QueryFragment, Clone, Debug)]
+#[cynic(
+    schema_path = "./assets/schema.sdl",
+    graphql_type = "Subscription",
+    variables = "TxArg"
+)]
+pub struct SubmitAndAwaitStatusSubscription {
+    #[arguments(tx: $tx)]
+    pub submit_and_await_status: TransactionStatus,
+}
+
+#[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(schema_path = "./assets/schema.sdl", graphql_type = "Query")]
 pub struct AllReceipts {
     pub all_receipts: Vec<Receipt>,
@@ -404,6 +455,7 @@ pub mod tests {
     use crate::client::schema::Bytes;
     use fuel_core_types::fuel_types::canonical::Serialize;
 
+    #[cfg(not(feature = "test-helpers"))]
     #[test]
     fn transparent_transaction_by_id_query_gql_output() {
         use cynic::QueryBuilder;
@@ -413,6 +465,7 @@ pub mod tests {
         insta::assert_snapshot!(operation.query)
     }
 
+    #[cfg(not(feature = "test-helpers"))]
     #[test]
     fn opaque_transaction_by_id_query_gql_output() {
         use cynic::QueryBuilder;
@@ -422,6 +475,7 @@ pub mod tests {
         insta::assert_snapshot!(operation.query)
     }
 
+    #[cfg(not(feature = "test-helpers"))]
     #[test]
     fn transactions_connection_query_gql_output() {
         use cynic::QueryBuilder;
@@ -434,6 +488,7 @@ pub mod tests {
         insta::assert_snapshot!(operation.query)
     }
 
+    #[cfg(not(feature = "test-helpers"))]
     #[test]
     fn transactions_by_owner_gql_output() {
         use cynic::QueryBuilder;
@@ -454,7 +509,8 @@ pub mod tests {
         let tx = fuel_tx::Transaction::default_test_tx();
         let query = DryRun::build(DryRunArg {
             txs: vec![HexString(Bytes(tx.to_bytes()))],
-            utxo_validation: None,
+            utxo_validation: Some(true),
+            gas_price: Some(123u64.into()),
         });
         insta::assert_snapshot!(query.query)
     }

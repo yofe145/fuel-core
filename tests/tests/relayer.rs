@@ -7,12 +7,13 @@ use ethers::{
     },
 };
 use fuel_core::{
+    combined_database::CombinedDatabase,
     database::Database,
+    fuel_core_graphql_api::storage::relayed_transactions::RelayedTransactionStatuses,
     relayer,
     service::{
         Config,
         FuelService,
-        ServiceTrait,
     },
 };
 use fuel_core_client::client::{
@@ -20,28 +21,34 @@ use fuel_core_client::client::{
         PageDirection,
         PaginationRequest,
     },
-    types::TransactionStatus,
+    types::{
+        RelayedTransactionStatus as ClientRelayedTransactionStatus,
+        TransactionStatus,
+    },
     FuelClient,
 };
 use fuel_core_poa::service::Mode;
-use fuel_core_relayer::{
-    test_helpers::{
-        middleware::MockMiddleware,
-        EvtToLog,
-        LogTestHelper,
-    },
-    H160,
+use fuel_core_relayer::test_helpers::{
+    middleware::MockMiddleware,
+    EvtToLog,
+    LogTestHelper,
 };
 use fuel_core_storage::{
     tables::Messages,
+    StorageAsMut,
     StorageAsRef,
 };
 use fuel_core_types::{
+    entities::relayer::transaction::RelayedTransactionStatus as FuelRelayedTransactionStatus,
     fuel_asm::*,
     fuel_crypto::*,
     fuel_tx::*,
-    fuel_types::Nonce,
+    fuel_types::{
+        BlockHeight,
+        Nonce,
+    },
 };
+use fuel_types::Bytes20;
 use hyper::{
     service::{
         make_service_fn,
@@ -84,6 +91,7 @@ async fn relayer_can_download_logs() {
             None,
             None,
             None,
+            0,
         )
     };
 
@@ -96,12 +104,10 @@ async fn relayer_can_download_logs() {
     let eth_node = Arc::new(eth_node);
     let eth_node_handle = spawn_eth_node(eth_node).await;
 
-    relayer_config.relayer = Some(
-        format!("http://{}", eth_node_handle.address)
-            .as_str()
-            .try_into()
-            .unwrap(),
-    );
+    relayer_config.relayer = Some(vec![format!("http://{}", eth_node_handle.address)
+        .as_str()
+        .try_into()
+        .unwrap()]);
     let db = Database::in_memory();
 
     let srv = FuelService::from_database(db.clone(), config)
@@ -129,7 +135,7 @@ async fn relayer_can_download_logs() {
             msg
         );
     }
-    srv.stop_and_await().await.unwrap();
+    srv.send_stop_signal_and_await_shutdown().await.unwrap();
     eth_node_handle.shutdown.send(()).unwrap();
 }
 
@@ -157,6 +163,7 @@ async fn messages_are_spendable_after_relayer_is_synced() {
         Some(recipient.into()),
         Some(amount),
         None,
+        0,
     )];
     eth_node.update_data(|data| data.logs_batch = vec![logs.clone()]);
     // Setup the eth node with a block high enough that there
@@ -165,12 +172,10 @@ async fn messages_are_spendable_after_relayer_is_synced() {
     let eth_node = Arc::new(eth_node);
     let eth_node_handle = spawn_eth_node(eth_node).await;
 
-    relayer_config.relayer = Some(
-        format!("http://{}", eth_node_handle.address)
-            .as_str()
-            .try_into()
-            .unwrap(),
-    );
+    relayer_config.relayer = Some(vec![format!("http://{}", eth_node_handle.address)
+        .as_str()
+        .try_into()
+        .unwrap()]);
 
     config.utxo_validation = true;
 
@@ -246,18 +251,127 @@ async fn messages_are_spendable_after_relayer_is_synced() {
     // there should be no messages after spending
     assert_eq!(query.results.len(), 0);
 
-    srv.stop_and_await().await.unwrap();
+    srv.send_stop_signal_and_await_shutdown().await.unwrap();
     eth_node_handle.shutdown.send(()).unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn can_find_failed_relayed_tx() {
+    let mut db = CombinedDatabase::in_memory();
+    let id = [1; 32].into();
+    let block_height: BlockHeight = 999.into();
+    let failure = "lolz".to_string();
+
+    // given
+    let status = FuelRelayedTransactionStatus::Failed {
+        block_height,
+        failure: failure.clone(),
+    };
+    db.off_chain_mut()
+        .storage_as_mut::<RelayedTransactionStatuses>()
+        .insert(&id, &status)
+        .unwrap();
+
+    // when
+    let srv = FuelService::from_combined_database(db.clone(), Config::local_node())
+        .await
+        .unwrap();
+    let client = FuelClient::from(srv.bound_address);
+
+    // then
+    let expected = Some(ClientRelayedTransactionStatus::Failed {
+        block_height,
+        failure,
+    });
+    let actual = client.relayed_transaction_status(&id).await.unwrap();
+    assert_eq!(expected, actual);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn can_restart_node_with_relayer_data() {
+    let mut rng = StdRng::seed_from_u64(1234);
+    let mut config = Config::local_node();
+    config.relayer = Some(relayer::Config::default());
+    let relayer_config = config.relayer.as_mut().expect("Expected relayer config");
+    let eth_node = MockMiddleware::default();
+    let contract_address = relayer_config.eth_v2_listening_contracts[0];
+
+    // setup a real spendable message
+    let secret_key: SecretKey = SecretKey::random(&mut rng);
+    let pk = secret_key.public_key();
+    let recipient = Input::owner(&pk);
+    let sender = Address::zeroed();
+    let amount = 100;
+    let nonce = Nonce::from(2u64);
+    let logs = vec![make_message_event(
+        nonce,
+        5,
+        contract_address,
+        Some(sender.into()),
+        Some(recipient.into()),
+        Some(amount),
+        None,
+        0,
+    )];
+    eth_node.update_data(|data| data.logs_batch = vec![logs.clone()]);
+    // Setup the eth node with a block high enough that there
+    // will be some finalized blocks.
+    eth_node.update_data(|data| data.best_block.number = Some(200.into()));
+    let eth_node = Arc::new(eth_node);
+    let eth_node_handle = spawn_eth_node(eth_node).await;
+
+    relayer_config.relayer = Some(vec![format!("http://{}", eth_node_handle.address)
+        .as_str()
+        .try_into()
+        .unwrap()]);
+
+    let capacity = 1024 * 1024;
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+
+    {
+        // Given
+        let database =
+            CombinedDatabase::open(tmp_dir.path(), capacity, Default::default()).unwrap();
+
+        let service = FuelService::from_combined_database(database, config.clone())
+            .await
+            .unwrap();
+        let client = FuelClient::from(service.bound_address);
+        client.health().await.unwrap();
+
+        for _ in 0..5 {
+            let tx = Transaction::default_test_tx();
+            client.submit_and_await_commit(&tx).await.unwrap();
+        }
+
+        service.send_stop_signal_and_await_shutdown().await.unwrap();
+    }
+
+    {
+        // When
+        let database =
+            CombinedDatabase::open(tmp_dir.path(), capacity, Default::default()).unwrap();
+        let service = FuelService::from_combined_database(database, config)
+            .await
+            .unwrap();
+        let client = FuelClient::from(service.bound_address);
+
+        // Then
+        client.health().await.unwrap();
+        service.send_stop_signal_and_await_shutdown().await.unwrap();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn make_message_event(
     nonce: Nonce,
     block_number: u64,
-    contract_address: H160,
+    contract_address: Bytes20,
     sender: Option<[u8; 32]>,
     recipient: Option<[u8; 32]>,
     amount: Option<u64>,
     data: Option<Vec<u8>>,
+    log_index: u64,
 ) -> Log {
     let message = fuel_core_relayer::bridge::MessageSentFilter {
         nonce: U256::from_big_endian(nonce.as_ref()),
@@ -267,8 +381,10 @@ fn make_message_event(
         data: data.map(Into::into).unwrap_or_default(),
     };
     let mut log = message.into_log();
-    log.address = contract_address;
+    log.address =
+        fuel_core_relayer::test_helpers::convert_to_address(contract_address.as_slice());
     log.block_number = Some(block_number.into());
+    log.log_index = Some(log_index.into());
     log
 }
 

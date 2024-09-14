@@ -27,16 +27,20 @@ use crate::client::pagination::{
 pub use primitives::*;
 
 pub mod balance;
+pub mod blob;
 pub mod block;
 pub mod chain;
 pub mod coins;
 pub mod contract;
 pub mod message;
 pub mod node_info;
+pub mod upgrades;
 
 pub mod gas_price;
 pub mod primitives;
 pub mod tx;
+
+pub mod relayed_tx;
 
 #[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(schema_path = "./assets/schema.sdl", graphql_type = "Query")]

@@ -181,6 +181,14 @@ apt install -y cmake pkg-config build-essential git clang libclang-dev
 pacman -Syu --needed --noconfirm cmake gcc pkgconf git clang
 ```
 
+### Rust setup
+
+You'll need `wasm32-unknown-unknown` target installed.
+
+```bash
+rustup target add wasm32-unknown-unknown
+```
+
 ### Compiling
 
 We recommend using `xtask` to build fuel-core:
@@ -217,9 +225,10 @@ USAGE:
     fuel-core run [OPTIONS]
 
 OPTIONS:
-        --chain <CHAIN_CONFIG>
-            Specify either an alias to a built-in configuration or filepath to a JSON file [default:
-            local_testnet]
+        --snapshot <SNAPSHOT>
+          Snapshot from which to do (re)genesis. Defaults to local testnet configuration
+
+          [env: SNAPSHOT=]
         ...
 ```
 
@@ -329,29 +338,41 @@ RET(RegId::ONE),
 
 ```console
 $ cargo run --bin fuel-core-client -- transaction submit \
-"{\"Script\":{\"script_gas_limit\":1000000,\"policies\":{\"bits\":\"GasPrice\",\"values\":[0,0,0,0]},\"maturity\":0,\"script\":[80,64,0,202,80,68,0,186,51,65,16,0,36,4,0,0],\"script_data\":[],\"inputs\":[
-{
-  \"CoinSigned\": {
-    \"utxo_id\": {
-      \"tx_id\": \"c49d65de61cf04588a764b557d25cc6c6b4bc0d7429227e2a21e61c213b3a3e2\",
-      \"output_index\": 0
+"{\"Script\":{
+    \"body\":{
+      \"script_gas_limit\":1000000,
+      \"receipts_root\":\"0000000000000000000000000000000000000000000000000000000000000000\",
+      \"script\":[80,64,0,202,80,68,0,186,51,65,16,0,36,4,0,0],
+      \"script_data\":[]
     },
-    \"owner\": \"f1e92c42b90934aa6372e30bc568a326f6e66a1a0288595e6e3fbd392a4f3e6e\",
-    \"amount\": 10599410012256088338,
-    \"asset_id\": \"2cafad611543e0265d89f1c2b60d9ebf5d56ad7e23d9827d6b522fd4d6e44bc3\",
-    \"tx_pointer\": {
-      \"block_height\": 0,
-      \"tx_index\": 0
-    },
-    \"witness_index\": 0,
-    \"maturity\": 0,
-    \"predicate_gas_used\": null,
-    \"predicate\": null,
-    \"predicate_data\": null
-  }
-}],\"outputs\":[],\"witnesses\":[{
-  \"data\": [
-    150,31,98,51,6,239,255,243,45,35,182,26,129,152,46,95,45,211,114,58,51,64,129,194,97,14,181,70,190,37,106,223,170,174,221,230,87,239,67,224,100,137,25,249,193,14,184,195,15,85,156,82,91,78,91,80,126,168,215,170,139,48,19,5
-  ]
-}],\"receipts_root\":\"0x6114142d12e0f58cfb8c72c270cd0535944fb1ba763dce83c17e882c482224a2\"}}"
+  \"policies\":{
+      \"bits\":\"Maturity | MaxFee\",
+      \"values\":[0,0,0,0]},
+  \"inputs\":[{
+    \"CoinSigned\":{
+      \"utxo_id\":{
+        \"tx_id\":\"c49d65de61cf04588a764b557d25cc6c6b4bc0d7429227e2a21e61c213b3a3e2\",
+        \"output_index\":33298
+      },
+      \"owner\":\"f1e92c42b90934aa6372e30bc568a326f6e66a1a0288595e6e3fbd392a4f3e6e\",
+      \"amount\":4294967295,
+      \"asset_id\":\"0000000000000000000000000000000000000000000000000000000000000000\",
+      \"tx_pointer\":{
+        \"block_height\":0,
+        \"tx_index\":0
+        },
+      \"witness_index\":0,
+      \"predicate_gas_used\":null,
+      \"predicate\":null,
+      \"predicate_data\":null}}],
+  \"outputs\":[],
+  \"witnesses\":[{
+    \"data\":[167,184,58,243,113,131,73,255,233,187,213,245,147,97,92,200,55,162,35,88,241,0,222,151,44,66,30,244,186,138,146,161,73,250,79,15,67,105,225,4,79,142,222,72,74,1,221,173,88,143,201,96,229,4,170,19,75,126,67,159,133,151,149,51]}
+  ]}}"
+```
+
+You may meet the error `Transaction is not inserted. UTXO does not exist` due to the UTXO validation. The UTXO validation can be turned off by adding the `--debug` flag.
+
+```console
+$ ./target/debug/fuel-core run --db-type in-memory --debug
 ```

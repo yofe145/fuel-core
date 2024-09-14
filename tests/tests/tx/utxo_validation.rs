@@ -116,7 +116,7 @@ async fn submit_utxo_verified_tx_below_min_gas_price_fails() {
 
     // initialize node with higher minimum gas price
     let mut test_builder = TestSetupBuilder::new(2322u64);
-    test_builder.min_gas_price = 10;
+    test_builder.starting_gas_price = 10;
     let TestContext {
         client,
         srv: _dont_drop,
@@ -166,12 +166,12 @@ async fn dry_run_override_utxo_validation() {
 
     let tx_statuses = context
         .client
-        .dry_run_opt(&[tx], Some(false))
+        .dry_run_opt(&[tx], Some(false), None)
         .await
         .unwrap();
     let log = tx_statuses
         .last()
-        .expect("Nonempty reponse")
+        .expect("Nonempty response")
         .result
         .receipts();
     assert_eq!(2, log.len());
@@ -217,7 +217,7 @@ async fn dry_run_no_utxo_validation_override() {
     let client = TestSetupBuilder::new(2322).finalize().await.client;
 
     // verify that the client validated the inputs and failed the tx
-    let res = client.dry_run_opt(&[tx], None).await;
+    let res = client.dry_run_opt(&[tx], None, None).await;
     assert!(res.is_err());
 }
 

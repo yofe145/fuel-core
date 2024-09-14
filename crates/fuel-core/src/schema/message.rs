@@ -8,11 +8,12 @@ use super::{
         TransactionId,
         U64,
     },
+    ReadViewProvider,
 };
 use crate::{
     fuel_core_graphql_api::{
-        database::ReadView,
         ports::OffChainDatabase,
+        QUERY_COSTS,
     },
     graphql_api::IntoApiResult,
     query::MessageQueryData,
@@ -33,7 +34,7 @@ use async_graphql::{
 };
 use fuel_core_types::entities;
 
-pub struct Message(pub(crate) entities::message::Message);
+pub struct Message(pub(crate) entities::relayer::message::Message);
 
 #[Object]
 impl Message {
@@ -67,16 +68,22 @@ pub struct MessageQuery {}
 
 #[Object]
 impl MessageQuery {
+    #[graphql(complexity = "QUERY_COSTS.storage_read + child_complexity")]
     async fn message(
         &self,
         ctx: &Context<'_>,
         #[graphql(desc = "The Nonce of the message")] nonce: Nonce,
     ) -> async_graphql::Result<Option<Message>> {
-        let query: &ReadView = ctx.data_unchecked();
+        let query = ctx.read_view()?;
         let nonce = nonce.0;
         query.message(&nonce).into_api_result()
     }
 
+    #[graphql(complexity = "{\
+        QUERY_COSTS.storage_iterator\
+        + (QUERY_COSTS.storage_read + first.unwrap_or_default() as usize) * child_complexity \
+        + (QUERY_COSTS.storage_read + last.unwrap_or_default() as usize) * child_complexity\
+    }")]
     async fn messages(
         &self,
         ctx: &Context<'_>,
@@ -87,7 +94,7 @@ impl MessageQuery {
         before: Option<String>,
     ) -> async_graphql::Result<Connection<HexString, Message, EmptyFields, EmptyFields>>
     {
-        let query: &ReadView = ctx.data_unchecked();
+        let query = ctx.read_view()?;
         crate::schema::query_pagination(
             after,
             before,
@@ -118,6 +125,8 @@ impl MessageQuery {
         .await
     }
 
+    // 256 * QUERY_COSTS.storage_read because the depth of the Merkle tree in the worst case is 256
+    #[graphql(complexity = "256 * QUERY_COSTS.storage_read + child_complexity")]
     async fn message_proof(
         &self,
         ctx: &Context<'_>,
@@ -126,7 +135,7 @@ impl MessageQuery {
         commit_block_id: Option<BlockId>,
         commit_block_height: Option<U32>,
     ) -> async_graphql::Result<Option<MessageProof>> {
-        let query: &ReadView = ctx.data_unchecked();
+        let query = ctx.read_view()?;
         let height = match (commit_block_id, commit_block_height) {
             (Some(commit_block_id), None) => {
                 query.block_height(&commit_block_id.0.into())?
@@ -140,7 +149,7 @@ impl MessageQuery {
         };
 
         Ok(crate::query::message_proof(
-            query,
+            query.as_ref(),
             transaction_id.into(),
             nonce.into(),
             height,
@@ -148,17 +157,18 @@ impl MessageQuery {
         .map(MessageProof))
     }
 
+    #[graphql(complexity = "QUERY_COSTS.storage_read + child_complexity")]
     async fn message_status(
         &self,
         ctx: &Context<'_>,
         nonce: Nonce,
     ) -> async_graphql::Result<MessageStatus> {
-        let query: &ReadView = ctx.data_unchecked();
-        let status = crate::query::message_status(query, nonce.into())?;
+        let query = ctx.read_view()?;
+        let status = crate::query::message_status(query.as_ref(), nonce.into())?;
         Ok(status.into())
     }
 }
-pub struct MerkleProof(pub(crate) entities::message::MerkleProof);
+pub struct MerkleProof(pub(crate) entities::relayer::message::MerkleProof);
 
 #[Object]
 impl MerkleProof {
@@ -176,7 +186,7 @@ impl MerkleProof {
     }
 }
 
-pub struct MessageProof(pub(crate) entities::message::MessageProof);
+pub struct MessageProof(pub(crate) entities::relayer::message::MessageProof);
 
 #[Object]
 impl MessageProof {
@@ -217,19 +227,19 @@ impl MessageProof {
     }
 }
 
-impl From<entities::message::Message> for Message {
-    fn from(message: entities::message::Message) -> Self {
+impl From<entities::relayer::message::Message> for Message {
+    fn from(message: entities::relayer::message::Message) -> Self {
         Message(message)
     }
 }
 
-impl From<entities::message::MerkleProof> for MerkleProof {
-    fn from(proof: entities::message::MerkleProof) -> Self {
+impl From<entities::relayer::message::MerkleProof> for MerkleProof {
+    fn from(proof: entities::relayer::message::MerkleProof) -> Self {
         MerkleProof(proof)
     }
 }
 
-pub struct MessageStatus(pub(crate) entities::message::MessageStatus);
+pub struct MessageStatus(pub(crate) entities::relayer::message::MessageStatus);
 
 #[derive(Enum, Copy, Clone, Eq, PartialEq)]
 enum MessageState {
@@ -242,15 +252,15 @@ enum MessageState {
 impl MessageStatus {
     async fn state(&self) -> MessageState {
         match self.0.state {
-            entities::message::MessageState::Unspent => MessageState::Unspent,
-            entities::message::MessageState::Spent => MessageState::Spent,
-            entities::message::MessageState::NotFound => MessageState::NotFound,
+            entities::relayer::message::MessageState::Unspent => MessageState::Unspent,
+            entities::relayer::message::MessageState::Spent => MessageState::Spent,
+            entities::relayer::message::MessageState::NotFound => MessageState::NotFound,
         }
     }
 }
 
-impl From<entities::message::MessageStatus> for MessageStatus {
-    fn from(status: entities::message::MessageStatus) -> Self {
+impl From<entities::relayer::message::MessageStatus> for MessageStatus {
+    fn from(status: entities::relayer::message::MessageStatus) -> Self {
         MessageStatus(status)
     }
 }

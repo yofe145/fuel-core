@@ -1,4 +1,10 @@
 use clap::Parser;
+use fuel_core::ShutdownListener;
+use fuel_core_chain_config::{
+    ChainConfig,
+    SnapshotReader,
+    StateConfig,
+};
 use std::{
     env,
     path::PathBuf,
@@ -14,14 +20,19 @@ use tracing_subscriber::{
 #[cfg(feature = "env")]
 use dotenvy::dotenv;
 
-lazy_static::lazy_static! {
-    pub static ref DEFAULT_DB_PATH: PathBuf = dirs::home_dir().unwrap().join(".fuel").join("db");
+pub fn default_db_path() -> PathBuf {
+    dirs::home_dir().unwrap().join(".fuel").join("db")
 }
 
 pub mod fee_contract;
+#[cfg(feature = "rocksdb")]
+pub mod rollback;
 pub mod run;
-#[cfg(any(feature = "rocksdb", feature = "rocksdb-production"))]
+#[cfg(feature = "rocksdb")]
 pub mod snapshot;
+
+// Default database cache is 1 GB
+pub const DEFAULT_DATABASE_CACHE_SIZE: usize = 1024 * 1024 * 1024;
 
 #[derive(Parser, Debug)]
 #[clap(
@@ -39,8 +50,10 @@ pub struct Opt {
 #[derive(Debug, Parser)]
 pub enum Fuel {
     Run(run::Command),
-    #[cfg(any(feature = "rocksdb", feature = "rocksdb-production"))]
+    #[cfg(feature = "rocksdb")]
     Snapshot(snapshot::Command),
+    #[cfg(feature = "rocksdb")]
+    Rollback(rollback::Command),
     GenerateFeeContract(fee_contract::Command),
 }
 
@@ -112,16 +125,17 @@ pub async fn run_cli() -> anyhow::Result<()> {
         let command = run::Command::try_parse();
         if let Ok(command) = command {
             tracing::warn!("This cli format for running `fuel-core` is deprecated and will be removed. Please use `fuel-core run` or use `--help` for more information");
-            return run::exec(command).await
+            return run::exec(command).await;
         }
     }
 
     match opt {
         Ok(opt) => match opt.command {
             Fuel::Run(command) => run::exec(command).await,
-            #[cfg(any(feature = "rocksdb", feature = "rocksdb-production"))]
-            Fuel::Snapshot(command) => snapshot::exec(command),
+            #[cfg(feature = "rocksdb")]
+            Fuel::Snapshot(command) => snapshot::exec(command).await,
             Fuel::GenerateFeeContract(command) => fee_contract::exec(command).await,
+            Fuel::Rollback(command) => rollback::exec(command).await,
         },
         Err(e) => {
             // Prints the error and exits.
@@ -130,7 +144,29 @@ pub async fn run_cli() -> anyhow::Result<()> {
     }
 }
 
-#[cfg(any(feature = "rocksdb", feature = "rocksdb-production"))]
+/// Returns the chain configuration for the local testnet.
+pub fn local_testnet_chain_config() -> ChainConfig {
+    const TESTNET_CHAIN_CONFIG: &[u8] =
+        include_bytes!("../chainspec/local-testnet/chain_config.json");
+    const TESTNET_CHAIN_CONFIG_STATE_BYTECODE: &[u8] =
+        include_bytes!("../chainspec/local-testnet/state_transition_bytecode.wasm");
+
+    let mut config: ChainConfig = serde_json::from_slice(TESTNET_CHAIN_CONFIG).unwrap();
+    config.state_transition_bytecode = TESTNET_CHAIN_CONFIG_STATE_BYTECODE.to_vec();
+    config
+}
+
+/// Returns the chain configuration for the local testnet.
+pub fn local_testnet_reader() -> SnapshotReader {
+    const TESTNET_STATE_CONFIG: &[u8] =
+        include_bytes!("../chainspec/local-testnet/state_config.json");
+
+    let state_config: StateConfig = serde_json::from_slice(TESTNET_STATE_CONFIG).unwrap();
+
+    SnapshotReader::new_in_memory(local_testnet_chain_config(), state_config)
+}
+
+#[cfg(feature = "rocksdb")]
 #[cfg(test)]
 mod tests {
     use anyhow::anyhow;
@@ -153,7 +189,7 @@ mod tests {
     }
 
     mod snapshot_tests {
-        use crate::cli::DEFAULT_DB_PATH;
+        use crate::cli::default_db_path;
 
         use super::*;
 
@@ -187,7 +223,7 @@ mod tests {
             let Fuel::Snapshot(snapshot::Command { database_path, .. }) = command else {
                 panic!("Expected a snapshot command")
             };
-            assert_eq!(database_path, DEFAULT_DB_PATH.as_path());
+            assert_eq!(database_path, default_db_path().as_path());
         }
 
         #[test]

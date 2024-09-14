@@ -1,7 +1,11 @@
+#![allow(non_snake_case)]
+
 use crate::{
+    ports::WasmValidityError,
     service::test_helpers::MockTxPoolGasPrice,
     test_helpers::{
         IntoEstimated,
+        MockWasmChecker,
         TextContext,
         TEST_COIN_AMOUNT,
     },
@@ -11,6 +15,7 @@ use crate::{
         create_contract_output,
         create_message_predicate_from_message,
     },
+    types::GasPrice,
     Config,
     Error,
 };
@@ -24,32 +29,37 @@ use fuel_core_types::{
         input::coin::CoinPredicate,
         Address,
         AssetId,
+        BlobBody,
+        BlobId,
+        BlobIdExt,
+        Bytes32,
+        ConsensusParameters,
         Contract,
+        Finalizable,
         Input,
         Output,
+        PredicateParameters,
         Transaction,
         TransactionBuilder,
+        TxParameters,
         UniqueIdentifier,
+        UpgradePurpose,
         UtxoId,
     },
     fuel_types::ChainId,
-    fuel_vm::checked_transaction::{
-        CheckError,
-        Checked,
+    fuel_vm::{
+        checked_transaction::{
+            CheckError,
+            Checked,
+        },
+        interpreter::MemoryInstance,
     },
 };
-
-use crate::types::GasPrice;
-use fuel_core_types::fuel_tx::Finalizable;
-use std::{
-    cmp::Reverse,
-    collections::HashMap,
-    vec,
-};
+use std::vec;
 
 use super::check_single_tx;
 
-const GAS_LIMIT: Word = 1000;
+const GAS_LIMIT: Word = 100000;
 
 async fn check_unwrap_tx(tx: Transaction, config: &Config) -> Checked<Transaction> {
     let gas_price = 0;
@@ -62,9 +72,16 @@ async fn check_unwrap_tx_with_gas_price(
     gas_price: GasPrice,
 ) -> Checked<Transaction> {
     let gas_price_provider = MockTxPoolGasPrice::new(gas_price);
-    check_single_tx(tx, Default::default(), config, &gas_price_provider)
-        .await
-        .expect("Transaction should be checked")
+    check_single_tx(
+        tx,
+        Default::default(),
+        config.utxo_validation,
+        &ConsensusParameters::default(),
+        &gas_price_provider,
+        MemoryInstance::new(),
+    )
+    .await
+    .expect("Transaction should be checked")
 }
 
 async fn check_tx(
@@ -81,7 +98,15 @@ async fn check_tx_with_gas_price(
     gas_price: GasPrice,
 ) -> Result<Checked<Transaction>, Error> {
     let gas_price_provider = MockTxPoolGasPrice::new(gas_price);
-    check_single_tx(tx, Default::default(), config, &gas_price_provider).await
+    check_single_tx(
+        tx,
+        Default::default(),
+        config.utxo_validation,
+        &ConsensusParameters::default(),
+        &gas_price_provider,
+        MemoryInstance::new(),
+    )
+    .await
 }
 
 #[tokio::test]
@@ -771,7 +796,7 @@ async fn tx_depth_hit() {
 }
 
 #[tokio::test]
-async fn sorted_out_tx1_2_4() {
+async fn sorted_out_tx1_2_3() {
     let mut context = TextContext::default();
 
     let (_, gas_coin) = context.setup_coin();
@@ -815,7 +840,7 @@ async fn sorted_out_tx1_2_4() {
         .expect("Tx2 should be Ok, got Err");
     txpool
         .insert_single(tx3)
-        .expect("Tx4 should be Ok, got Err");
+        .expect("Tx3 should be Ok, got Err");
 
     let txs = txpool.sorted_includable().collect::<Vec<_>>();
 
@@ -826,35 +851,31 @@ async fn sorted_out_tx1_2_4() {
 }
 
 #[tokio::test]
-async fn find_dependent_tx1_tx2() {
+async fn sorted_out_tx_same_tips() {
     let mut context = TextContext::default();
 
     let (_, gas_coin) = context.setup_coin();
-    let (output, unset_input) = context.create_output_and_input(10_000);
     let tx1 = TransactionBuilder::script(vec![], vec![])
-        .tip(11)
-        .max_fee_limit(11)
-        .script_gas_limit(GAS_LIMIT)
-        .add_input(gas_coin)
-        .add_output(output)
-        .finalize_as_transaction();
-
-    let input = unset_input.into_input(UtxoId::new(tx1.id(&Default::default()), 0));
-    let (output, unset_input) = context.create_output_and_input(7_500);
-    let tx2 = TransactionBuilder::script(vec![], vec![])
         .tip(10)
         .max_fee_limit(10)
         .script_gas_limit(GAS_LIMIT)
-        .add_input(input)
-        .add_output(output)
+        .add_input(gas_coin)
         .finalize_as_transaction();
 
-    let input = unset_input.into_input(UtxoId::new(tx2.id(&Default::default()), 0));
+    let (_, gas_coin) = context.setup_coin();
+    let tx2 = TransactionBuilder::script(vec![], vec![])
+        .tip(10)
+        .max_fee_limit(10)
+        .script_gas_limit(GAS_LIMIT / 2)
+        .add_input(gas_coin)
+        .finalize_as_transaction();
+
+    let (_, gas_coin) = context.setup_coin();
     let tx3 = TransactionBuilder::script(vec![], vec![])
-        .tip(9)
-        .max_fee_limit(9)
-        .script_gas_limit(GAS_LIMIT)
-        .add_input(input)
+        .tip(10)
+        .max_fee_limit(10)
+        .script_gas_limit(GAS_LIMIT / 4)
+        .add_input(gas_coin)
         .finalize_as_transaction();
 
     let tx1_id = tx1.id(&ChainId::default());
@@ -868,26 +889,147 @@ async fn find_dependent_tx1_tx2() {
 
     txpool
         .insert_single(tx1)
-        .expect("Tx0 should be Ok, got Err");
+        .expect("Tx1 should be Ok, got Err");
     txpool
         .insert_single(tx2)
-        .expect("Tx1 should be Ok, got Err");
-    let tx3_result = txpool
-        .insert_single(tx3)
         .expect("Tx2 should be Ok, got Err");
-
-    let mut seen = HashMap::new();
     txpool
-        .dependency()
-        .find_dependent(tx3_result.inserted, &mut seen, txpool.txs());
+        .insert_single(tx3)
+        .expect("Tx4 should be Ok, got Err");
 
-    let mut list: Vec<_> = seen.into_values().collect();
-    // sort from high to low price
-    list.sort_by_key(|tx| Reverse(tx.tip()));
-    assert_eq!(list.len(), 3, "We should have three items");
-    assert_eq!(list[0].id(), tx1_id, "Tx1 should be first.");
-    assert_eq!(list[1].id(), tx2_id, "Tx2 should be second.");
-    assert_eq!(list[2].id(), tx3_id, "Tx3 should be third.");
+    let txs = txpool.sorted_includable().collect::<Vec<_>>();
+
+    assert_eq!(txs.len(), 3, "Should have 3 txs");
+    assert_eq!(txs[0].id(), tx3_id, "First should be tx3");
+    assert_eq!(txs[1].id(), tx2_id, "Second should be tx2");
+    assert_eq!(txs[2].id(), tx1_id, "Third should be tx1");
+}
+
+#[tokio::test]
+async fn sorted_out_tx_profitable_ratios() {
+    let mut context = TextContext::default();
+
+    let (_, gas_coin) = context.setup_coin();
+    let tx1 = TransactionBuilder::script(vec![], vec![])
+        .tip(4)
+        .max_fee_limit(4)
+        .script_gas_limit(GAS_LIMIT)
+        .add_input(gas_coin)
+        .finalize_as_transaction();
+
+    let (_, gas_coin) = context.setup_coin();
+    let tx2 = TransactionBuilder::script(vec![], vec![])
+        .tip(2)
+        .max_fee_limit(2)
+        .script_gas_limit(GAS_LIMIT / 10)
+        .add_input(gas_coin)
+        .finalize_as_transaction();
+
+    let (_, gas_coin) = context.setup_coin();
+    let tx3 = TransactionBuilder::script(vec![], vec![])
+        .tip(1)
+        .max_fee_limit(1)
+        .script_gas_limit(GAS_LIMIT / 100)
+        .add_input(gas_coin)
+        .finalize_as_transaction();
+
+    let tx1_id = tx1.id(&ChainId::default());
+    let tx2_id = tx2.id(&ChainId::default());
+    let tx3_id = tx3.id(&ChainId::default());
+
+    let mut txpool = context.build();
+    let tx1 = check_unwrap_tx(tx1, &txpool.config).await;
+    let tx2 = check_unwrap_tx(tx2, &txpool.config).await;
+    let tx3 = check_unwrap_tx(tx3, &txpool.config).await;
+
+    txpool
+        .insert_single(tx1)
+        .expect("Tx1 should be Ok, got Err");
+    txpool
+        .insert_single(tx2)
+        .expect("Tx2 should be Ok, got Err");
+    txpool
+        .insert_single(tx3)
+        .expect("Tx4 should be Ok, got Err");
+
+    let txs = txpool.sorted_includable().collect::<Vec<_>>();
+
+    assert_eq!(txs.len(), 3, "Should have 3 txs");
+    assert_eq!(txs[0].id(), tx3_id, "First should be tx3");
+    assert_eq!(txs[1].id(), tx2_id, "Second should be tx2");
+    assert_eq!(txs[2].id(), tx1_id, "Third should be tx1");
+}
+
+#[tokio::test]
+async fn sorted_out_tx_by_creation_instant() {
+    let mut context = TextContext::default();
+
+    let (_, gas_coin) = context.setup_coin();
+    let tx1 = TransactionBuilder::script(vec![], vec![])
+        .tip(4)
+        .max_fee_limit(4)
+        .script_gas_limit(GAS_LIMIT)
+        .add_input(gas_coin)
+        .finalize_as_transaction();
+
+    let (_, gas_coin) = context.setup_coin();
+    let tx2 = TransactionBuilder::script(vec![], vec![])
+        .tip(4)
+        .max_fee_limit(4)
+        .script_gas_limit(GAS_LIMIT)
+        .add_input(gas_coin)
+        .finalize_as_transaction();
+
+    let (_, gas_coin) = context.setup_coin();
+    let tx3 = TransactionBuilder::script(vec![], vec![])
+        .tip(4)
+        .max_fee_limit(4)
+        .script_gas_limit(GAS_LIMIT)
+        .add_input(gas_coin)
+        .finalize_as_transaction();
+
+    let (_, gas_coin) = context.setup_coin();
+    let tx4 = TransactionBuilder::script(vec![], vec![])
+        .tip(4)
+        .max_fee_limit(4)
+        .script_gas_limit(GAS_LIMIT)
+        .add_input(gas_coin)
+        .finalize_as_transaction();
+
+    let tx1_id = tx1.id(&ChainId::default());
+    let tx2_id = tx2.id(&ChainId::default());
+    let tx3_id = tx3.id(&ChainId::default());
+    let tx4_id = tx4.id(&ChainId::default());
+
+    let mut txpool = context.build();
+    let tx1 = check_unwrap_tx(tx1, &txpool.config).await;
+    let tx2 = check_unwrap_tx(tx2, &txpool.config).await;
+    let tx3 = check_unwrap_tx(tx3, &txpool.config).await;
+    let tx4 = check_unwrap_tx(tx4, &txpool.config).await;
+
+    txpool
+        .insert_single(tx1)
+        .expect("Tx1 should be Ok, got Err");
+    txpool
+        .insert_single(tx2)
+        .expect("Tx2 should be Ok, got Err");
+    txpool
+        .insert_single(tx3)
+        .expect("Tx4 should be Ok, got Err");
+    txpool
+        .insert_single(tx4)
+        .expect("Tx4 should be Ok, got Err");
+
+    let txs = txpool.sorted_includable().collect::<Vec<_>>();
+
+    // This order doesn't match the lexicographical order of the tx ids
+    // and so it verifies that the txs are sorted by creation instant
+    // The newest tx should be first
+    assert_eq!(txs.len(), 4, "Should have 4 txs");
+    assert_eq!(txs[0].id(), tx1_id, "First should be tx1");
+    assert_eq!(txs[1].id(), tx2_id, "Second should be tx2");
+    assert_eq!(txs[2].id(), tx3_id, "Third should be tx3");
+    assert_eq!(txs[3].id(), tx4_id, "Fourth should be tx4");
 }
 
 #[tokio::test]
@@ -959,30 +1101,6 @@ async fn tx_inserted_into_pool_when_input_message_id_exists_in_db() {
 
     let tx_info = txpool.find_one(&tx1_id).unwrap();
     assert_eq!(tx_info.tx().id(), tx1_id);
-}
-
-#[tokio::test]
-async fn tx_rejected_when_input_message_id_is_spent() {
-    let mut context = TextContext::default();
-    let (message, input) = create_message_predicate_from_message(5_000, 0);
-
-    let tx = TransactionBuilder::script(vec![], vec![])
-        .script_gas_limit(GAS_LIMIT)
-        .add_input(input)
-        .finalize_as_transaction();
-
-    context.database_mut().insert_message(message.clone());
-    context.database_mut().spend_message(*message.id());
-    let mut txpool = context.build();
-
-    let tx = check_unwrap_tx(tx, &txpool.config).await;
-    let err = txpool.insert_single(tx).expect_err("should fail");
-
-    // check error
-    assert!(matches!(
-        err,
-        Error::NotInsertedInputMessageSpent(msg_id) if msg_id == *message.id()
-    ));
 }
 
 #[tokio::test]
@@ -1180,17 +1298,16 @@ async fn predicates_with_incorrect_owner_fails() {
 #[tokio::test]
 async fn predicate_without_enough_gas_returns_out_of_gas() {
     let mut context = TextContext::default();
-    let mut config = Config::default();
-    config
-        .chain_config
-        .consensus_parameters
-        .predicate_params
-        .max_gas_per_predicate = 10000;
-    config
-        .chain_config
-        .consensus_parameters
-        .tx_params
-        .max_gas_per_tx = 10000;
+
+    let gas_limit = 10000;
+
+    let mut consensus_parameters = ConsensusParameters::default();
+    consensus_parameters
+        .set_tx_params(TxParameters::default().with_max_gas_per_tx(gas_limit));
+    consensus_parameters.set_predicate_params(
+        PredicateParameters::default().with_max_gas_per_predicate(gas_limit),
+    );
+
     let coin = context
         .custom_predicate(
             AssetId::BASE,
@@ -1199,7 +1316,7 @@ async fn predicate_without_enough_gas_returns_out_of_gas() {
             vec![op::jmp(RegId::ZERO)].into_iter().collect(),
             None,
         )
-        .into_estimated(&config.chain_config.consensus_parameters);
+        .into_estimated(&consensus_parameters);
 
     let tx = TransactionBuilder::script(vec![], vec![])
         .script_gas_limit(GAS_LIMIT)
@@ -1243,4 +1360,194 @@ async fn predicate_that_returns_false_is_invalid() {
         err.to_string().contains("PredicateVerificationFailed"),
         "unexpected error: {err}",
     )
+}
+
+#[tokio::test]
+async fn insert_single__blob_tx_works() {
+    let program = vec![123; 123];
+    let tx = TransactionBuilder::blob(BlobBody {
+        id: BlobId::compute(program.as_slice()),
+        witness_index: 0,
+    })
+    .add_witness(program.into())
+    .add_random_fee_input()
+    .finalize_as_transaction();
+
+    let config = Config {
+        utxo_validation: false,
+        ..Default::default()
+    };
+    let context = TextContext::default().config(config);
+    let mut txpool = context.build();
+
+    // Given
+    let tx = check_unwrap_tx(tx, &txpool.config).await;
+    let id = tx.id();
+
+    // When
+    let result = txpool.insert_single(tx);
+
+    // Then
+    let _ = result.expect("Should insert blob");
+    assert!(txpool.by_hash.contains_key(&id));
+}
+
+#[tokio::test]
+async fn insert_single__blob_tx_fails_if_blob_already_inserted_and_lower_tip() {
+    let program = vec![123; 123];
+    let blob_id = BlobId::compute(program.as_slice());
+    let tx = TransactionBuilder::blob(BlobBody {
+        id: blob_id,
+        witness_index: 0,
+    })
+    .add_witness(program.clone().into())
+    .add_random_fee_input()
+    .finalize_as_transaction();
+
+    let config = Config {
+        utxo_validation: false,
+        ..Default::default()
+    };
+    let context = TextContext::default().config(config);
+    let mut txpool = context.build();
+    let tx = check_unwrap_tx(tx, &txpool.config).await;
+
+    // Given
+    txpool.insert_single(tx).unwrap();
+    let same_blob_tx = TransactionBuilder::blob(BlobBody {
+        id: blob_id,
+        witness_index: 1,
+    })
+    .add_random_fee_input()
+    .add_witness(program.into())
+    .finalize_as_transaction();
+    let same_blob_tx = check_unwrap_tx(same_blob_tx, &txpool.config).await;
+
+    // When
+    let result = txpool.insert_single(same_blob_tx);
+
+    // Then
+    assert_eq!(result, Err(Error::NotInsertedCollisionBlobId(blob_id)));
+}
+
+#[tokio::test]
+async fn insert_single__blob_tx_succeeds_if_blob_already_inserted_but_higher_tip() {
+    let program = vec![123; 123];
+    let blob_id = BlobId::compute(program.as_slice());
+    let tx = TransactionBuilder::blob(BlobBody {
+        id: blob_id,
+        witness_index: 0,
+    })
+    .add_witness(program.clone().into())
+    .add_random_fee_input()
+    .finalize_as_transaction();
+
+    let config = Config {
+        utxo_validation: false,
+        ..Default::default()
+    };
+    let context = TextContext::default().config(config);
+    let mut txpool = context.build();
+    let tx = check_unwrap_tx(tx, &txpool.config).await;
+
+    // Given
+    txpool.insert_single(tx).unwrap();
+    let same_blob_tx = TransactionBuilder::blob(BlobBody {
+        id: blob_id,
+        witness_index: 1,
+    })
+    .add_random_fee_input()
+    .add_witness(program.into())
+    .tip(100)
+    .max_fee_limit(100)
+    .finalize_as_transaction();
+    let same_blob_tx = check_unwrap_tx(same_blob_tx, &txpool.config).await;
+
+    // When
+    let result = txpool.insert_single(same_blob_tx);
+
+    // Then
+    let _ = result.expect("Should insert transaction with the same blob but higher tip");
+}
+
+#[tokio::test]
+async fn insert_single__blob_tx_fails_if_blob_already_exists_in_database() {
+    let program = vec![123; 123];
+    let blob_id = BlobId::compute(program.as_slice());
+    let tx = TransactionBuilder::blob(BlobBody {
+        id: blob_id,
+        witness_index: 0,
+    })
+    .add_witness(program.clone().into())
+    .add_random_fee_input()
+    .finalize_as_transaction();
+
+    let config = Config {
+        utxo_validation: false,
+        ..Default::default()
+    };
+    let context = TextContext::default().config(config);
+    let mut txpool = context.build();
+    let tx = check_unwrap_tx(tx, &txpool.config).await;
+
+    // Given
+    txpool.database.0.insert_dummy_blob(blob_id);
+
+    // When
+    let result = txpool.insert_single(tx);
+
+    // Then
+    assert_eq!(result, Err(Error::NotInsertedBlobIdAlreadyTaken(blob_id)));
+}
+
+#[tokio::test]
+async fn insert_inner__rejects_upgrade_tx_with_invalid_wasm() {
+    let predicate = vec![op::ret(1)].into_iter().collect::<Vec<u8>>();
+    let privileged_address = Input::predicate_owner(predicate.clone());
+
+    let config = Config {
+        utxo_validation: false,
+        ..Default::default()
+    };
+    let context = TextContext::default()
+        .config(config)
+        .wasm_checker(MockWasmChecker {
+            result: Err(WasmValidityError::NotValid),
+        });
+    let mut txpool = context.build();
+    let gas_price_provider = MockTxPoolGasPrice::new(0);
+
+    // Given
+    let tx = TransactionBuilder::upgrade(UpgradePurpose::StateTransition {
+        root: Bytes32::new([1; 32]),
+    })
+    .add_input(Input::coin_predicate(
+        UtxoId::new(Bytes32::new([1; 32]), 0),
+        privileged_address,
+        1_000_000_000,
+        AssetId::BASE,
+        Default::default(),
+        Default::default(),
+        predicate,
+        vec![],
+    ))
+    .finalize_as_transaction();
+    let mut params = ConsensusParameters::default();
+    params.set_privileged_address(privileged_address);
+    let tx = check_single_tx(
+        tx,
+        Default::default(),
+        false,
+        &params,
+        &gas_price_provider,
+        MemoryInstance::new(),
+    )
+    .await
+    .expect("Transaction should be checked");
+
+    // When
+    let result = txpool.insert_single(tx);
+
+    // Then
+    assert_eq!(result, Err(Error::NotInsertedInvalidWasm));
 }

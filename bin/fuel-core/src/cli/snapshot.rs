@@ -1,31 +1,21 @@
-use crate::cli::DEFAULT_DB_PATH;
+use crate::cli::default_db_path;
 use anyhow::Context;
 use clap::{
     Parser,
     Subcommand,
 };
 use fuel_core::{
-    chain_config::{
-        ChainConfig,
-        ChainStateDb,
-    },
-    database::{
-        database_description::on_chain::OnChain,
-        Database,
-    },
+    combined_database::CombinedDatabase,
+    state::historical_rocksdb::StateRewindPolicy,
     types::fuel_types::ContractId,
 };
-use fuel_core_chain_config::{
-    SnapshotMetadata,
-    StateWriter,
-    MAX_GROUP_SIZE,
-};
-use fuel_core_storage::Result as StorageResult;
-use itertools::Itertools;
+use fuel_core_chain_config::ChainConfig;
 use std::path::{
     Path,
     PathBuf,
 };
+
+use super::local_testnet_chain_config;
 
 /// Print a snapshot of blockchain state to stdout.
 #[derive(Debug, Clone, Parser)]
@@ -35,17 +25,25 @@ pub struct Command {
         name = "DB_PATH",
         long = "db-path",
         value_parser,
-        default_value = (*DEFAULT_DB_PATH).to_str().unwrap()
+        default_value = default_db_path().into_os_string()
     )]
-    pub(crate) database_path: PathBuf,
+    pub database_path: PathBuf,
 
     /// Where to save the snapshot
     #[arg(name = "OUTPUT_DIR", long = "output-directory")]
-    pub(crate) output_dir: PathBuf,
+    pub output_dir: PathBuf,
+
+    /// The maximum database cache size in bytes.
+    #[arg(
+        long = "max-database-cache-size",
+        default_value_t = super::DEFAULT_DATABASE_CACHE_SIZE,
+        env
+    )]
+    pub max_database_cache_size: usize,
 
     /// The sub-command of the snapshot operation.
     #[command(subcommand)]
-    pub(crate) subcommand: SubCommands,
+    pub subcommand: SubCommands,
 }
 
 #[derive(Subcommand, Debug, Clone, Copy)]
@@ -64,6 +62,16 @@ pub enum Encoding {
         )]
         compression: u8,
     },
+}
+
+impl Encoding {
+    fn group_size(self) -> Option<usize> {
+        match self {
+            Encoding::Json => None,
+            #[cfg(feature = "parquet")]
+            Encoding::Parquet { group_size, .. } => Some(group_size),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -104,10 +112,22 @@ pub enum SubCommands {
     },
 }
 
-#[cfg(any(feature = "rocksdb", feature = "rocksdb-production"))]
-pub fn exec(command: Command) -> anyhow::Result<()> {
-    let db = open_db(&command.database_path)?;
+#[cfg(feature = "rocksdb")]
+pub async fn exec(command: Command) -> anyhow::Result<()> {
+    use fuel_core::service::genesis::Exporter;
+    use fuel_core_chain_config::{
+        SnapshotWriter,
+        MAX_GROUP_SIZE,
+    };
+
+    use crate::cli::ShutdownListener;
+
+    let db = open_db(
+        &command.database_path,
+        Some(command.max_database_cache_size),
+    )?;
     let output_dir = command.output_dir;
+    let shutdown_listener = ShutdownListener::spawn();
 
     match command.subcommand {
         SubCommands::Everything {
@@ -118,132 +138,56 @@ pub fn exec(command: Command) -> anyhow::Result<()> {
             let encoding = encoding_command
                 .map(|f| f.encoding())
                 .unwrap_or_else(|| Encoding::Json);
-            full_snapshot(chain_config, &output_dir, encoding, &db)
+
+            let group_size = encoding.group_size().unwrap_or(MAX_GROUP_SIZE);
+            let writer = move || match encoding {
+                Encoding::Json => Ok(SnapshotWriter::json(output_dir.clone())),
+                #[cfg(feature = "parquet")]
+                Encoding::Parquet { compression, .. } => {
+                    SnapshotWriter::parquet(output_dir.clone(), compression.try_into()?)
+                }
+            };
+            Exporter::new(
+                db,
+                load_chain_config_or_use_testnet(chain_config.as_deref())?,
+                writer,
+                group_size,
+                shutdown_listener,
+            )
+            .write_full_snapshot()
+            .await
         }
         SubCommands::Contract { contract_id } => {
-            contract_snapshot(&db, contract_id, &output_dir)
+            let writer = move || Ok(SnapshotWriter::json(output_dir.clone()));
+            Exporter::new(
+                db,
+                local_testnet_chain_config(),
+                writer,
+                MAX_GROUP_SIZE,
+                shutdown_listener,
+            )
+            .write_contract_snapshot(contract_id)
+            .await
         }
     }
 }
 
-fn contract_snapshot(
-    db: impl ChainStateDb,
-    contract_id: ContractId,
-    output_dir: &Path,
-) -> Result<(), anyhow::Error> {
-    std::fs::create_dir_all(output_dir)?;
-
-    let (contract, state, balance) = db.get_contract_by_id(contract_id)?;
-    let block = db.get_last_block()?;
-
-    let metadata = write_metadata(output_dir, Encoding::Json)?;
-    let mut writer = StateWriter::for_snapshot(&metadata)?;
-
-    writer.write_contracts(vec![contract])?;
-    writer.write_contract_state(state)?;
-    writer.write_contract_balance(balance)?;
-    writer.write_block_data(*block.header().height(), block.header().da_height)?;
-    writer.close()?;
-    Ok(())
-}
-
-fn full_snapshot(
-    prev_chain_config: Option<PathBuf>,
-    output_dir: &Path,
-    encoding: Encoding,
-    db: impl ChainStateDb,
-) -> Result<(), anyhow::Error> {
-    std::fs::create_dir_all(output_dir)?;
-
-    let metadata = write_metadata(output_dir, encoding)?;
-
-    write_chain_state(&db, &metadata)?;
-    write_chain_config(prev_chain_config, metadata.chain_config())?;
-    Ok(())
-}
-
-fn write_chain_config(
-    chain_config: Option<PathBuf>,
-    file: &Path,
-) -> Result<(), anyhow::Error> {
-    let chain_config = load_chain_config(chain_config)?;
-
-    chain_config.write(file)
-}
-
-fn write_metadata(dir: &Path, encoding: Encoding) -> anyhow::Result<SnapshotMetadata> {
-    match encoding {
-        Encoding::Json => SnapshotMetadata::write_json(dir),
-        #[cfg(feature = "parquet")]
-        Encoding::Parquet {
-            compression,
-            group_size,
-            ..
-        } => SnapshotMetadata::write_parquet(dir, compression.try_into()?, group_size),
+fn load_chain_config_or_use_testnet(path: Option<&Path>) -> anyhow::Result<ChainConfig> {
+    if let Some(path) = path {
+        ChainConfig::load(path)
+    } else {
+        Ok(local_testnet_chain_config())
     }
 }
 
-fn write_chain_state(
-    db: impl ChainStateDb,
-    metadata: &SnapshotMetadata,
-) -> anyhow::Result<()> {
-    let mut writer = StateWriter::for_snapshot(metadata)?;
-    fn write<T>(
-        data: impl Iterator<Item = StorageResult<T>>,
-        group_size: usize,
-        mut write: impl FnMut(Vec<T>) -> anyhow::Result<()>,
-    ) -> anyhow::Result<()> {
-        data.chunks(group_size)
-            .into_iter()
-            .try_for_each(|chunk| write(chunk.try_collect()?))
-    }
-    let group_size = metadata
-        .state_encoding()
-        .group_size()
-        .unwrap_or(MAX_GROUP_SIZE);
-
-    let coins = db.iter_coin_configs();
-    write(coins, group_size, |chunk| writer.write_coins(chunk))?;
-
-    let messages = db.iter_message_configs();
-    write(messages, group_size, |chunk| writer.write_messages(chunk))?;
-
-    let contracts = db.iter_contract_configs();
-    write(contracts, group_size, |chunk| writer.write_contracts(chunk))?;
-
-    let contract_states = db.iter_contract_state_configs();
-    write(contract_states, group_size, |chunk| {
-        writer.write_contract_state(chunk)
-    })?;
-
-    let contract_balances = db.iter_contract_balance_configs();
-    write(contract_balances, group_size, |chunk| {
-        writer.write_contract_balance(chunk)
-    })?;
-
-    let block = db.get_last_block()?;
-    writer.write_block_data(*block.header().height(), block.header().da_height)?;
-
-    writer.close()?;
-
-    Ok(())
-}
-
-fn load_chain_config(
-    chain_config: Option<PathBuf>,
-) -> Result<ChainConfig, anyhow::Error> {
-    let chain_config = match chain_config {
-        Some(file) => ChainConfig::load(file)?,
-        None => ChainConfig::local_testnet(),
-    };
-
-    Ok(chain_config)
-}
-
-fn open_db(path: &Path) -> anyhow::Result<Database> {
-    Database::<OnChain>::open_rocksdb(path, None)
-        .map_err(Into::<anyhow::Error>::into)
-        .context(format!("failed to open database at path {path:?}",))
+fn open_db(path: &Path, capacity: Option<usize>) -> anyhow::Result<CombinedDatabase> {
+    CombinedDatabase::open(
+        path,
+        capacity.unwrap_or(1024 * 1024 * 1024),
+        StateRewindPolicy::NoRewind,
+    )
+    .map_err(Into::<anyhow::Error>::into)
+    .context(format!("failed to open combined database at path {path:?}",))
 }
 
 #[cfg(test)]
@@ -251,15 +195,26 @@ mod tests {
 
     use std::iter::repeat_with;
 
+    use fuel_core::{
+        fuel_core_graphql_api::storage::transactions::{
+            OwnedTransactionIndexKey,
+            OwnedTransactions,
+            TransactionStatuses,
+        },
+        producer::ports::BlockProducerDatabase,
+    };
     use fuel_core_chain_config::{
-        CoinConfig,
-        ContractBalanceConfig,
-        ContractConfig,
-        ContractStateConfig,
-        MessageConfig,
+        AddTable,
+        AsTable,
+        LastBlockConfig,
+        SnapshotMetadata,
+        SnapshotReader,
         StateConfig,
+        StateConfigBuilder,
+        TableEntry,
     };
     use fuel_core_storage::{
+        structured_storage::TableWithBlueprint,
         tables::{
             Coins,
             ContractsAssets,
@@ -268,11 +223,9 @@ mod tests {
             ContractsState,
             FuelBlocks,
             Messages,
+            Transactions,
         },
-        transactional::{
-            IntoTransaction,
-            StorageTransaction,
-        },
+        transactional::AtomicView,
         ContractsAssetKey,
         ContractsStateKey,
         StorageAsMut,
@@ -288,16 +241,23 @@ mod tests {
                 CompressedCoinV1,
             },
             contract::ContractUtxoInfo,
-            message::{
+            relayer::message::{
                 Message,
                 MessageV1,
             },
         },
         fuel_tx::{
+            Receipt,
+            TransactionBuilder,
             TxPointer,
+            UniqueIdentifier,
             UtxoId,
         },
+        fuel_types::ChainId,
+        services::txpool::TransactionStatus,
+        tai64::Tai64,
     };
+    use itertools::Itertools;
     use rand::{
         rngs::StdRng,
         seq::SliceRandom,
@@ -306,86 +266,276 @@ mod tests {
     };
     use test_case::test_case;
 
+    use crate::cli::DEFAULT_DATABASE_CACHE_SIZE;
+
     use super::*;
 
     struct DbPopulator {
-        db: StorageTransaction<Database>,
+        db: CombinedDatabase,
         rng: StdRng,
     }
 
-    impl DbPopulator {
-        fn new(db: Database, rng: StdRng) -> Self {
+    #[derive(Debug, PartialEq)]
+    struct SnapshotData {
+        common: CommonData,
+        transactions: Vec<TableEntry<Transactions>>,
+        transaction_statuses: Vec<TableEntry<TransactionStatuses>>,
+        owned_transactions: Vec<TableEntry<OwnedTransactions>>,
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct CommonData {
+        coins: Vec<TableEntry<Coins>>,
+        messages: Vec<TableEntry<Messages>>,
+        contract_code: Vec<TableEntry<ContractsRawCode>>,
+        contract_utxo: Vec<TableEntry<ContractsLatestUtxo>>,
+        contract_state: Vec<TableEntry<ContractsState>>,
+        contract_balance: Vec<TableEntry<ContractsAssets>>,
+        block: TableEntry<FuelBlocks>,
+    }
+
+    impl CommonData {
+        fn sorted(mut self) -> CommonData {
+            self.coins.sort_by_key(|e| e.key);
+            self.messages.sort_by_key(|e| e.key);
+            self.contract_code.sort_by_key(|e| e.key);
+            self.contract_utxo.sort_by_key(|e| e.key);
+            self.contract_state.sort_by_key(|e| e.key);
+            self.contract_balance.sort_by_key(|e| e.key);
+            self
+        }
+    }
+
+    impl SnapshotData {
+        fn sorted(mut self) -> SnapshotData {
+            self.common = self.common.sorted();
+            self.transactions.sort_by_key(|e| e.key);
+            self.transaction_statuses.sort_by_key(|e| e.key);
+            self.owned_transactions.sort_by_key(|e| e.key.clone());
+            self
+        }
+
+        fn into_state_config(self) -> StateConfig {
+            let mut builder = StateConfigBuilder::default();
+            builder.add(self.common.coins);
+            builder.add(self.common.messages);
+            builder.add(self.common.contract_code);
+            builder.add(self.common.contract_utxo);
+            builder.add(self.common.contract_state);
+            builder.add(self.common.contract_balance);
+
+            builder
+                .build(Some(LastBlockConfig::from_header(
+                    self.common.block.value.header(),
+                    Default::default(),
+                )))
+                .unwrap()
+        }
+
+        fn read_from_snapshot(snapshot: SnapshotMetadata) -> Self {
+            let mut reader = SnapshotReader::open(snapshot).unwrap();
+
+            fn read<T>(reader: &mut SnapshotReader) -> Vec<TableEntry<T>>
+            where
+                T: TableWithBlueprint,
+                StateConfig: AsTable<T>,
+                TableEntry<T>: serde::de::DeserializeOwned,
+            {
+                reader
+                    .read::<T>()
+                    .unwrap()
+                    .into_iter()
+                    .flatten_ok()
+                    .try_collect()
+                    .unwrap()
+            }
+
+            let block = {
+                let mut block = CompressedBlock::default();
+                let last_block_config = reader
+                    .last_block_config()
+                    .cloned()
+                    .expect("Expects the last block config to be set");
+                block.header_mut().application_mut().da_height =
+                    last_block_config.da_block_height;
+                block
+                    .header_mut()
+                    .set_block_height(last_block_config.block_height);
+                TableEntry {
+                    key: last_block_config.block_height,
+                    value: block,
+                }
+            };
+
+            let reader = &mut reader;
+
             Self {
-                db: db.into_transaction(),
-                rng,
+                common: CommonData {
+                    coins: read(reader),
+                    messages: read(reader),
+                    contract_code: read(reader),
+                    contract_utxo: read(reader),
+                    contract_state: read(reader),
+                    contract_balance: read(reader),
+                    block,
+                },
+                transactions: read(reader),
+                transaction_statuses: read(reader),
+                owned_transactions: read(reader),
             }
         }
+    }
 
-        fn commit(self) {
-            self.db.commit().expect("failed to commit transaction");
+    impl DbPopulator {
+        fn new(db: CombinedDatabase, rng: StdRng) -> Self {
+            Self { db, rng }
         }
 
-        fn given_persisted_state(
-            &mut self,
-            coins: usize,
-            messages: usize,
-            contracts: usize,
-            states_per_contract: usize,
-            balances_per_contract: usize,
-        ) -> StateConfig {
-            let coins = repeat_with(|| self.given_coin()).take(coins).collect();
+        // Db will flush data upon being dropped. Important to do before snapshotting
+        fn flush(self) {}
 
-            let messages = repeat_with(|| self.given_message())
-                .take(messages)
+        fn given_persisted_data(&mut self) -> SnapshotData {
+            let amount = 10;
+            let coins = repeat_with(|| self.given_coin()).take(amount).collect();
+            let messages = repeat_with(|| self.given_message()).take(amount).collect();
+
+            let contract_ids = repeat_with(|| {
+                let contract_id: ContractId = self.rng.gen();
+                contract_id
+            })
+            .take(amount)
+            .collect_vec();
+
+            let contract_code = contract_ids
+                .iter()
+                .map(|id| self.given_contract_code(*id))
                 .collect();
 
-            let contracts: Vec<ContractConfig> = repeat_with(|| self.given_contract())
-                .take(contracts)
+            let contract_utxo = contract_ids
+                .iter()
+                .map(|id| self.given_contract_utxo(*id))
                 .collect();
 
-            let contract_state = {
-                let ids = contracts.iter().map(|contract| contract.contract_id);
-                (0..states_per_contract)
-                    .cartesian_product(ids)
-                    .map(|(_, id)| self.given_contract_state(id))
-                    .collect()
-            };
+            let contract_state = contract_ids
+                .iter()
+                .flat_map(|id| {
+                    repeat_with(|| self.given_contract_state(*id))
+                        .take(amount)
+                        .collect_vec()
+                })
+                .collect();
 
-            let contract_balance = {
-                let ids = contracts.iter().map(|contract| contract.contract_id);
-                (0..balances_per_contract)
-                    .cartesian_product(ids)
-                    .map(|(_, id)| self.given_contract_balance(id))
-                    .collect()
-            };
+            let contract_balance = contract_ids
+                .iter()
+                .flat_map(|id| {
+                    repeat_with(|| self.given_contract_asset(*id))
+                        .take(amount)
+                        .collect_vec()
+                })
+                .collect();
+
+            let transactions = vec![self.given_transaction()];
+
+            let transaction_statuses = vec![self.given_transaction_status()];
+
+            let owned_transactions = vec![self.given_owned_transaction()];
 
             let block = self.given_block();
 
-            StateConfig {
-                coins,
-                messages,
-                contracts,
-                contract_state,
-                contract_balance,
-                block_height: *block.header().height(),
-                da_block_height: block.header().da_height,
+            SnapshotData {
+                common: CommonData {
+                    coins,
+                    messages,
+                    contract_code,
+                    contract_utxo,
+                    contract_state,
+                    contract_balance,
+                    block,
+                },
+                transactions,
+                transaction_statuses,
+                owned_transactions,
             }
         }
 
-        fn given_block(&mut self) -> CompressedBlock {
+        fn given_transaction(&mut self) -> TableEntry<Transactions> {
+            let tx = TransactionBuilder::script(
+                self.generate_data(1000),
+                self.generate_data(1000),
+            )
+            .finalize_as_transaction();
+
+            let id = tx.id(&ChainId::new(self.rng.gen::<u64>()));
+
+            self.db
+                .on_chain_mut()
+                .storage_as_mut::<Transactions>()
+                .insert(&id, &tx)
+                .unwrap();
+
+            TableEntry { key: id, value: tx }
+        }
+
+        fn given_transaction_status(&mut self) -> TableEntry<TransactionStatuses> {
+            let key = self.rng.gen();
+            let status = TransactionStatus::Success {
+                block_height: self.rng.gen(),
+                time: Tai64(self.rng.gen::<u32>().into()),
+                result: None,
+                receipts: vec![Receipt::Return {
+                    id: self.rng.gen(),
+                    val: self.rng.gen(),
+                    pc: self.rng.gen(),
+                    is: self.rng.gen(),
+                }],
+                total_gas: self.rng.gen(),
+                total_fee: self.rng.gen(),
+            };
+
+            self.db
+                .off_chain_mut()
+                .storage_as_mut::<TransactionStatuses>()
+                .insert(&key, &status)
+                .unwrap();
+
+            TableEntry { key, value: status }
+        }
+
+        fn given_owned_transaction(&mut self) -> TableEntry<OwnedTransactions> {
+            let key = OwnedTransactionIndexKey {
+                owner: self.rng.gen(),
+                block_height: self.rng.gen(),
+                tx_idx: self.rng.gen(),
+            };
+            let value = self.rng.gen();
+
+            self.db
+                .off_chain_mut()
+                .storage_as_mut::<OwnedTransactions>()
+                .insert(&key, &value)
+                .unwrap();
+
+            TableEntry { key, value }
+        }
+
+        fn given_block(&mut self) -> TableEntry<FuelBlocks> {
             let mut block = CompressedBlock::default();
-            let height = 10u32.into();
-            block.header_mut().application_mut().da_height = 14u64.into();
+            let height = self.rng.gen();
+            block.header_mut().application_mut().da_height = self.rng.gen();
             block.header_mut().set_block_height(height);
             let _ = self
                 .db
+                .on_chain_mut()
                 .storage_as_mut::<FuelBlocks>()
                 .insert(&height, &block);
 
-            block
+            TableEntry {
+                key: height,
+                value: block,
+            }
         }
 
-        fn given_coin(&mut self) -> CoinConfig {
+        fn given_coin(&mut self) -> TableEntry<Coins> {
             let tx_id = self.rng.gen();
             let output_index = self.rng.gen();
             let coin = CompressedCoin::V1(CompressedCoinV1 {
@@ -394,23 +544,17 @@ mod tests {
                 asset_id: self.rng.gen(),
                 tx_pointer: self.rng.gen(),
             });
+            let key = UtxoId::new(tx_id, output_index);
             self.db
+                .on_chain_mut()
                 .storage_as_mut::<Coins>()
-                .insert(&UtxoId::new(tx_id, output_index), &coin)
+                .insert(&key, &coin)
                 .unwrap();
 
-            CoinConfig {
-                tx_id,
-                output_index,
-                tx_pointer_block_height: coin.tx_pointer().block_height(),
-                tx_pointer_tx_idx: coin.tx_pointer().tx_index(),
-                owner: *coin.owner(),
-                amount: *coin.amount(),
-                asset_id: *coin.asset_id(),
-            }
+            TableEntry { key, value: coin }
         }
 
-        fn given_message(&mut self) -> MessageConfig {
+        fn given_message(&mut self) -> TableEntry<Messages> {
             let message = Message::V1(MessageV1 {
                 sender: self.rng.gen(),
                 recipient: self.rng.gen(),
@@ -420,49 +564,89 @@ mod tests {
                 da_height: DaBlockHeight(self.rng.gen()),
             });
 
+            let key = *message.nonce();
             self.db
+                .on_chain_mut()
                 .storage_as_mut::<Messages>()
-                .insert(message.nonce(), &message)
+                .insert(&key, &message)
                 .unwrap();
 
-            MessageConfig {
-                sender: *message.sender(),
-                recipient: *message.recipient(),
-                nonce: *message.nonce(),
-                amount: message.amount(),
-                data: message.data().clone(),
-                da_height: message.da_height(),
+            TableEntry {
+                key,
+                value: message,
             }
         }
 
-        fn given_contract(&mut self) -> ContractConfig {
-            let contract_id = self.rng.gen();
+        fn given_contract_code(
+            &mut self,
+            contract_id: ContractId,
+        ) -> TableEntry<ContractsRawCode> {
+            let key = contract_id;
 
             let code = self.generate_data(1000);
             self.db
+                .on_chain_mut()
                 .storage_as_mut::<ContractsRawCode>()
-                .insert(&contract_id, code.as_ref())
+                .insert(&key, code.as_ref())
                 .unwrap();
 
+            TableEntry {
+                key,
+                value: code.into(),
+            }
+        }
+
+        fn given_contract_utxo(
+            &mut self,
+            contract_id: ContractId,
+        ) -> TableEntry<ContractsLatestUtxo> {
             let utxo_id = UtxoId::new(self.rng.gen(), self.rng.gen());
             let tx_pointer = TxPointer::new(self.rng.gen(), self.rng.gen());
 
+            let value = ContractUtxoInfo::V1((utxo_id, tx_pointer).into());
             self.db
+                .on_chain_mut()
                 .storage::<ContractsLatestUtxo>()
-                .insert(
-                    &contract_id,
-                    &ContractUtxoInfo::V1((utxo_id, tx_pointer).into()),
-                )
+                .insert(&contract_id, &value)
                 .unwrap();
 
-            ContractConfig {
-                contract_id,
-                code,
-                tx_id: *utxo_id.tx_id(),
-                output_index: utxo_id.output_index(),
-                tx_pointer_block_height: tx_pointer.block_height(),
-                tx_pointer_tx_idx: tx_pointer.tx_index(),
+            TableEntry {
+                key: contract_id,
+                value,
             }
+        }
+
+        fn given_contract_state(
+            &mut self,
+            contract_id: ContractId,
+        ) -> TableEntry<ContractsState> {
+            let state_key = self.rng.gen();
+            let key = ContractsStateKey::new(&contract_id, &state_key);
+            let state_value = self.generate_data(100);
+            self.db
+                .on_chain_mut()
+                .storage_as_mut::<ContractsState>()
+                .insert(&key, &state_value)
+                .unwrap();
+            TableEntry {
+                key,
+                value: state_value.into(),
+            }
+        }
+
+        fn given_contract_asset(
+            &mut self,
+            contract_id: ContractId,
+        ) -> TableEntry<ContractsAssets> {
+            let asset_id = self.rng.gen();
+            let key = ContractsAssetKey::new(&contract_id, &asset_id);
+            let amount = self.rng.gen();
+            self.db
+                .on_chain_mut()
+                .storage_as_mut::<ContractsAssets>()
+                .insert(&key, &amount)
+                .unwrap();
+            TableEntry { key, value: amount }
         }
 
         fn generate_data(&mut self, max_amount: usize) -> Vec<u8> {
@@ -470,81 +654,57 @@ mod tests {
             self.rng.fill(data.as_mut_slice());
             data
         }
-
-        fn given_contract_state(
-            &mut self,
-            contract_id: ContractId,
-        ) -> ContractStateConfig {
-            let state_key = self.rng.gen();
-            let key = ContractsStateKey::new(&contract_id, &state_key);
-            let value = self.generate_data(100);
-            self.db
-                .storage_as_mut::<ContractsState>()
-                .insert(&key, &value)
-                .unwrap();
-
-            ContractStateConfig {
-                contract_id,
-                key: state_key,
-                value,
-            }
-        }
-
-        fn given_contract_balance(
-            &mut self,
-            contract_id: ContractId,
-        ) -> ContractBalanceConfig {
-            let asset_id = self.rng.gen();
-            let key = ContractsAssetKey::new(&contract_id, &asset_id);
-            let amount = self.rng.gen();
-
-            self.db
-                .storage_as_mut::<ContractsAssets>()
-                .insert(&key, &amount)
-                .unwrap();
-
-            ContractBalanceConfig {
-                contract_id,
-                asset_id,
-                amount,
-            }
-        }
     }
 
     #[cfg_attr(feature = "parquet", test_case(Encoding::Parquet { group_size: 2, compression: 1 }; "parquet"))]
     #[test_case(Encoding::Json; "json")]
     fn everything_snapshot_correct_and_sorted(encoding: Encoding) -> anyhow::Result<()> {
+        use pretty_assertions::assert_eq;
+
         // given
         let temp_dir = tempfile::tempdir()?;
 
         let snapshot_dir = temp_dir.path().join("snapshot");
         let db_path = temp_dir.path().join("db");
-        let mut db = DbPopulator::new(open_db(&db_path)?, StdRng::seed_from_u64(2));
+        std::fs::create_dir(&db_path)?;
 
-        let block = db.given_block();
-        let state = db.given_persisted_state(10, 10, 10, 10, 10);
-        db.commit();
+        let mut db = DbPopulator::new(open_db(&db_path, None)?, StdRng::seed_from_u64(2));
+        let state = db.given_persisted_data();
+        db.flush();
 
         // when
-        exec(Command {
+        let fut = exec(Command {
             database_path: db_path,
+            max_database_cache_size: DEFAULT_DATABASE_CACHE_SIZE,
             output_dir: snapshot_dir.clone(),
             subcommand: SubCommands::Everything {
                 chain_config: None,
                 encoding_command: Some(EncodingCommand::Encoding { encoding }),
             },
-        })?;
+        });
+
+        // Because the test_case macro doesn't work with async tests
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(fut)
+            .unwrap();
 
         // then
         let snapshot = SnapshotMetadata::read(&snapshot_dir)?;
 
-        let snapshot = StateConfig::from_snapshot_metadata(snapshot)?;
+        let written_data = SnapshotData::read_from_snapshot(snapshot);
 
-        assert_eq!(snapshot.block_height, *block.header().height());
-        assert_eq!(snapshot.da_block_height, block.header().da_height);
+        assert_eq!(written_data.common.block, state.common.block);
 
-        assert_ne!(snapshot, state);
-        assert_eq!(snapshot, sorted_state(state));
+        // Needed because of the way the test case macro works
+        #[allow(irrefutable_let_patterns)]
+        if let Encoding::Json = encoding {
+            assert_ne!(written_data.common, state.common);
+            assert_eq!(written_data.common, state.common.sorted());
+        } else {
+            assert_ne!(written_data, state);
+            assert_eq!(written_data, state.sorted());
+        }
 
         Ok(())
     }
@@ -553,26 +713,23 @@ mod tests {
     #[test_case(2; "parquet group_size=2")]
     #[test_case(5; "parquet group_size=5")]
     fn everything_snapshot_respects_group_size(group_size: usize) -> anyhow::Result<()> {
-        use fuel_core_chain_config::{
-            ParquetFiles,
-            StateReader,
-        };
+        use fuel_core_chain_config::SnapshotReader;
 
         // given
         let temp_dir = tempfile::tempdir()?;
 
         let snapshot_dir = temp_dir.path().join("snapshot");
         let db_path = temp_dir.path().join("db");
-        let mut db = DbPopulator::new(open_db(&db_path)?, StdRng::seed_from_u64(2));
+        let mut db = DbPopulator::new(open_db(&db_path, None)?, StdRng::seed_from_u64(2));
 
-        db.given_block();
-        let state = db.given_persisted_state(10, 10, 10, 10, 10);
-        db.commit();
+        let state = db.given_persisted_data();
+        db.flush();
 
         // when
-        exec(Command {
+        let fut = exec(Command {
             database_path: db_path,
             output_dir: snapshot_dir.clone(),
+            max_database_cache_size: DEFAULT_DATABASE_CACHE_SIZE,
             subcommand: SubCommands::Everything {
                 chain_config: None,
                 encoding_command: Some(EncodingCommand::Encoding {
@@ -582,85 +739,71 @@ mod tests {
                     },
                 }),
             },
-        })?;
+        });
+
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(fut)
+            .unwrap();
 
         // then
-        let files = ParquetFiles::snapshot_default(&snapshot_dir);
-        let reader = StateReader::parquet(files)?;
+        let snapshot = SnapshotMetadata::read(&snapshot_dir)?;
+        let mut reader = SnapshotReader::open(snapshot)?;
 
-        let expected_state = sorted_state(state);
-
-        assert_groups_as_expected(group_size, expected_state.coins, || {
-            reader.coins().unwrap()
-        });
-        assert_groups_as_expected(group_size, expected_state.messages, || {
-            reader.messages().unwrap()
-        });
-
-        assert_groups_as_expected(group_size, expected_state.contracts, || {
-            reader.contracts().unwrap()
-        });
-
-        assert_groups_as_expected(group_size, expected_state.contract_state, || {
-            reader.contract_state().unwrap()
-        });
-
-        assert_groups_as_expected(group_size, expected_state.contract_balance, || {
-            reader.contract_balance().unwrap()
-        });
+        let expected_state = state.sorted();
+        assert_groups_as_expected(group_size, expected_state.common.coins, &mut reader);
 
         Ok(())
     }
 
-    #[test]
-    fn contract_snapshot_isolates_contract_correctly() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn contract_snapshot_isolates_contract_correctly() -> anyhow::Result<()> {
         // given
         let temp_dir = tempfile::tempdir()?;
         let snapshot_dir = temp_dir.path().join("snapshot");
 
         let db_path = temp_dir.path().join("db");
-        let mut db = DbPopulator::new(open_db(&db_path)?, StdRng::seed_from_u64(2));
+        let mut db = DbPopulator::new(open_db(&db_path, None)?, StdRng::seed_from_u64(2));
 
-        let state = sorted_state(db.given_persisted_state(10, 10, 10, 10, 10));
-        let random_contract = state.contracts.choose(&mut db.rng).unwrap().clone();
-        let contract_id = random_contract.contract_id;
-        db.commit();
+        let original_state = db.given_persisted_data().sorted().into_state_config();
+
+        let randomly_chosen_contract = original_state
+            .contracts
+            .choose(&mut db.rng)
+            .unwrap()
+            .clone();
+        let contract_id = randomly_chosen_contract.contract_id;
+        let mut latest_block = original_state.last_block.unwrap();
+        latest_block.blocks_root = db
+            .db
+            .on_chain()
+            .latest_view()
+            .unwrap()
+            .block_header_merkle_root(&latest_block.block_height)
+            .unwrap();
+        db.flush();
 
         // when
         exec(Command {
             database_path: db_path,
             output_dir: snapshot_dir.clone(),
+            max_database_cache_size: DEFAULT_DATABASE_CACHE_SIZE,
             subcommand: SubCommands::Contract { contract_id },
-        })?;
+        })
+        .await?;
 
         // then
         let metadata = SnapshotMetadata::read(&snapshot_dir)?;
         let snapshot_state = StateConfig::from_snapshot_metadata(metadata)?;
 
-        let expected_contract_state = state
-            .contract_state
-            .iter()
-            .filter(|state| state.contract_id == contract_id)
-            .cloned()
-            .collect_vec();
-
-        let expected_contract_balance = state
-            .contract_balance
-            .iter()
-            .filter(|balance| balance.contract_id == contract_id)
-            .cloned()
-            .collect_vec();
-
-        assert_eq!(
+        pretty_assertions::assert_eq!(
             snapshot_state,
             StateConfig {
                 coins: vec![],
                 messages: vec![],
-                contract_state: expected_contract_state,
-                contract_balance: expected_contract_balance,
-                contracts: vec![random_contract],
-                block_height: state.block_height,
-                da_block_height: state.da_block_height,
+                blobs: vec![],
+                contracts: vec![randomly_chosen_contract],
+                last_block: Some(latest_block),
             }
         );
 
@@ -668,38 +811,25 @@ mod tests {
     }
 
     #[cfg(feature = "parquet")]
-    fn assert_groups_as_expected<T, I>(
-        group_size: usize,
-        expected_data: Vec<T>,
-        actual_data: impl FnOnce() -> I,
+    fn assert_groups_as_expected<T>(
+        expected_group_size: usize,
+        expected_data: Vec<TableEntry<T>>,
+        reader: &mut SnapshotReader,
     ) where
-        T: PartialEq + std::fmt::Debug,
-        I: Iterator<Item = anyhow::Result<fuel_core_chain_config::Group<T>>>,
+        T: TableWithBlueprint,
+        T::OwnedKey: serde::de::DeserializeOwned + core::fmt::Debug + PartialEq,
+        T::OwnedValue: serde::de::DeserializeOwned + core::fmt::Debug + PartialEq,
+        StateConfig: AsTable<T>,
     {
+        let actual: Vec<_> = reader.read().unwrap().into_iter().try_collect().unwrap();
+
         let expected = expected_data
             .into_iter()
-            .chunks(group_size)
+            .chunks(expected_group_size)
             .into_iter()
             .map(|chunk| chunk.collect_vec())
             .collect_vec();
 
-        let actual = actual_data().map(|group| group.unwrap().data).collect_vec();
-
         assert_eq!(actual, expected);
-    }
-
-    fn sorted_state(mut state: StateConfig) -> StateConfig {
-        state
-            .coins
-            .sort_by_key(|coin| UtxoId::new(coin.tx_id, coin.output_index));
-        state.messages.sort_by_key(|msg| msg.nonce);
-        state.contracts.sort_by_key(|contract| contract.contract_id);
-        state
-            .contract_state
-            .sort_by_key(|state| (state.contract_id, state.key));
-        state
-            .contract_balance
-            .sort_by_key(|balance| (balance.contract_id, balance.asset_id));
-        state
     }
 }

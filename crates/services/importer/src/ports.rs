@@ -35,19 +35,19 @@ use fuel_core_types::{
     },
     services::executor::{
         Result as ExecutorResult,
-        UncommittedResult,
+        UncommittedValidationResult,
     },
 };
 
 #[cfg_attr(test, mockall::automock(type Database = crate::importer::test::MockDatabase;))]
 /// The executors port.
-pub trait Executor: Send + Sync {
+pub trait Validator: Send + Sync {
     /// Executes the block and returns the result of execution with uncommitted database
     /// transaction.
-    fn execute_without_commit(
+    fn validate(
         &self,
-        block: Block,
-    ) -> ExecutorResult<UncommittedResult<Changes>>;
+        block: &Block,
+    ) -> ExecutorResult<UncommittedValidationResult<Changes>>;
 }
 
 /// The trait indicates that the type supports storage transactions.
@@ -62,7 +62,7 @@ pub trait Transactional {
 }
 
 /// The alias port used by the block importer.
-pub trait ImporterDatabase: Transactional + Send + Sync {
+pub trait ImporterDatabase: Send + Sync {
     /// Returns the latest block height.
     fn latest_block_height(&self) -> StorageResult<Option<BlockHeight>>;
 
@@ -139,18 +139,18 @@ where
         let height = block.entity.header().height();
         let mut found = storage
             .storage_as_mut::<FuelBlocks>()
-            .insert(height, &block.entity.compress(chain_id))?
+            .replace(height, &block.entity.compress(chain_id))?
             .is_some();
         found |= storage
             .storage_as_mut::<SealedBlockConsensus>()
-            .insert(height, &block.consensus)?
+            .replace(height, &block.consensus)?
             .is_some();
 
         // TODO: Use `batch_insert` from https://github.com/FuelLabs/fuel-core/pull/1576
         for tx in block.entity.transactions() {
             found |= storage
                 .storage_as_mut::<Transactions>()
-                .insert(&tx.id(chain_id), tx)?
+                .replace(&tx.id(chain_id), tx)?
                 .is_some();
         }
         storage.commit()?;

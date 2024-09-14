@@ -16,10 +16,10 @@ async-trait = { workspace = true }
 fuel-core-chain-config = { workspace = true }
 fuel-core-metrics = { workspace = true } # TODO make this a feature
 fuel-core-services = { workspace = true }
-fuel-core-storage = { workspace = true }
-fuel-core-types = { workspace = true, features = ["serde"] }
+fuel-core-storage = { workspace = true, features = ["std"] }
+fuel-core-types = { workspace = true, features = ["std", "serde"] }
 futures = { workspace = true }
-hex = "0.4"
+hex = { workspace = true }
 ip_network = "0.4"
 libp2p = { version = "0.53.2", default-features = false, features = [
   "dns",
@@ -42,8 +42,9 @@ prometheus-client = { workspace = true }
 quick-protobuf = "0.8.1"
 quick-protobuf-codec = "0.3.0"
 rand = { workspace = true }
+rayon = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-serde_with = "1.11"
+serde_with = { workspace = true }
 sha2 = "0.10"
 thiserror = "1.0.47"
 tokio = { workspace = true, features = ["sync"] }
@@ -53,6 +54,7 @@ void = "1"
 [dev-dependencies]
 ctor = "0.1"
 fuel-core-p2p = { path = ".", features = ["test-helpers"] }
+fuel-core-services = { path = "../../services", features = ["test-helpers"] }
 fuel-core-trace = { path = "../../trace" }
 fuel-core-types = { path = "../../types", features = ["serde", "test-helpers"] }
 rand = { workspace = true }

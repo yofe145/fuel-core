@@ -1,3 +1,4 @@
+use super::Bytes32;
 use crate::client::schema::{
     schema,
     BlockId,
@@ -5,17 +6,14 @@ use crate::client::schema::{
     PageInfo,
     Signature,
     Tai64Timestamp,
+    TransactionId,
+    U16,
     U32,
     U64,
 };
 use fuel_core_types::{
     fuel_crypto,
     fuel_types::BlockHeight,
-};
-
-use super::{
-    tx::TransactionIdFragment,
-    Bytes32,
 };
 
 #[derive(cynic::QueryVariables, Debug)]
@@ -75,14 +73,21 @@ pub struct BlockEdge {
     pub node: Block,
 }
 
-/// Block with transactiuon ids
+#[derive(cynic::Enum, Clone, Debug)]
+#[cynic(schema_path = "./assets/schema.sdl")]
+pub enum BlockVersion {
+    V1,
+}
+
+/// Block with transaction ids
 #[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(schema_path = "./assets/schema.sdl")]
 pub struct Block {
+    pub version: BlockVersion,
     pub id: BlockId,
     pub header: Header,
     pub consensus: Consensus,
-    pub transactions: Vec<TransactionIdFragment>,
+    pub transaction_ids: Vec<TransactionId>,
 }
 
 #[derive(cynic::QueryFragment, Clone, Debug)]
@@ -114,17 +119,25 @@ pub struct BlockMutation {
     pub produce_blocks: U32,
 }
 
+#[derive(cynic::Enum, Clone, Debug)]
+#[cynic(schema_path = "./assets/schema.sdl")]
+pub enum HeaderVersion {
+    V1,
+}
+
 #[derive(cynic::QueryFragment, Clone, Debug)]
 #[cynic(schema_path = "./assets/schema.sdl")]
 pub struct Header {
+    pub version: HeaderVersion,
     pub id: BlockId,
     pub da_height: U64,
     pub consensus_parameters_version: U32,
     pub state_transition_bytecode_version: U32,
-    pub transactions_count: U64,
-    pub message_receipt_count: U64,
+    pub transactions_count: U16,
+    pub message_receipt_count: U32,
     pub transactions_root: Bytes32,
-    pub message_receipt_root: Bytes32,
+    pub message_outbox_root: Bytes32,
+    pub event_inbox_root: Bytes32,
     pub height: U32,
     pub prev_root: Bytes32,
     pub time: Tai64Timestamp,
@@ -147,6 +160,7 @@ pub struct Genesis {
     pub coins_root: Bytes32,
     pub contracts_root: Bytes32,
     pub messages_root: Bytes32,
+    pub transactions_root: Bytes32,
 }
 
 #[derive(cynic::QueryFragment, Clone, Debug)]

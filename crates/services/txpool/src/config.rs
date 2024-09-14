@@ -1,5 +1,4 @@
 use crate::types::ContractId;
-use fuel_core_chain_config::ChainConfig;
 use fuel_core_types::{
     fuel_tx::{
         Address,
@@ -64,8 +63,6 @@ pub struct Config {
     pub max_depth: usize,
     /// Flag to disable utxo existence and signature checks
     pub utxo_validation: bool,
-    /// chain config
-    pub chain_config: ChainConfig,
     /// Enables prometheus metrics for this fuel-service
     pub metrics: bool,
     /// Transaction TTL
@@ -76,6 +73,7 @@ pub struct Config {
     pub blacklist: BlackList,
 }
 
+#[cfg(feature = "test-helpers")]
 impl Default for Config {
     fn default() -> Self {
         let max_tx = 4064;
@@ -88,7 +86,6 @@ impl Default for Config {
         Self::new(
             max_tx,
             max_depth,
-            ChainConfig::default(),
             utxo_validation,
             metrics,
             transaction_ttl,
@@ -103,7 +100,6 @@ impl Config {
     pub fn new(
         max_tx: usize,
         max_depth: usize,
-        chain_config: ChainConfig,
         utxo_validation: bool,
         metrics: bool,
         transaction_ttl: Duration,
@@ -116,7 +112,6 @@ impl Config {
             max_tx,
             max_depth,
             utxo_validation,
-            chain_config,
             metrics,
             transaction_ttl,
             number_of_active_subscription,

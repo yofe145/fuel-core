@@ -1,5 +1,3 @@
-use std::marker::PhantomData;
-
 use anyhow::{
     anyhow,
     Context,
@@ -16,32 +14,20 @@ use parquet::{
     record::RowAccessor,
 };
 
-use crate::config::state::{
-    Group,
-    GroupResult,
-};
-
-pub type PostcardDecoder<T> = Decoder<std::fs::File, T, PostcardDecode>;
-
-pub struct Decoder<R: ChunkReader, T, D> {
+pub struct Decoder<R: ChunkReader> {
     data_source: SerializedFileReader<R>,
     group_index: usize,
-    _data: PhantomData<T>,
-    _decoder: PhantomData<D>,
 }
 
-pub trait Decode<T> {
-    fn decode(bytes: &[u8]) -> anyhow::Result<T>
-    where
-        Self: Sized;
-}
-
-impl<R, T, D> Decoder<R, T, D>
+impl<R> Decoder<R>
 where
     R: ChunkReader + 'static,
-    D: Decode<T>,
 {
-    fn current_group(&self) -> anyhow::Result<Group<T>> {
+    pub fn num_groups(&self) -> usize {
+        self.data_source.num_row_groups()
+    }
+
+    fn current_group(&self) -> anyhow::Result<Vec<Vec<u8>>> {
         let data = self
             .data_source
             .get_row_group(self.group_index)?
@@ -49,28 +35,24 @@ where
             .map(|result| {
                 result.map_err(|e| anyhow!(e)).and_then(|row| {
                     const FIELD_IDX: usize = 0;
-                    let bytes = row
+                    Ok(row
                         .get_bytes(FIELD_IDX)
                         .context("While decoding postcard bytes")?
-                        .as_bytes();
-                    D::decode(bytes)
+                        .as_bytes()
+                        .to_vec())
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(Group {
-            index: self.group_index,
-            data,
-        })
+        Ok(data)
     }
 }
 
-impl<R, T, D> Iterator for Decoder<R, T, D>
+impl<R> Iterator for Decoder<R>
 where
     R: ChunkReader + 'static,
-    D: Decode<T>,
 {
-    type Item = GroupResult<T>;
+    type Item = anyhow::Result<Vec<Vec<u8>>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.group_index >= self.data_source.metadata().num_row_groups() {
@@ -89,27 +71,11 @@ where
     }
 }
 
-impl<R: ChunkReader + 'static, T, D> Decoder<R, T, D> {
+impl<R: ChunkReader + 'static> Decoder<R> {
     pub fn new(reader: R) -> anyhow::Result<Self> {
         Ok(Self {
             data_source: SerializedFileReader::new(reader)?,
             group_index: 0,
-            _data: PhantomData,
-            _decoder: PhantomData,
         })
-    }
-}
-
-pub struct PostcardDecode;
-
-impl<T> Decode<T> for PostcardDecode
-where
-    T: serde::de::DeserializeOwned,
-{
-    fn decode(bytes: &[u8]) -> anyhow::Result<T>
-    where
-        Self: Sized,
-    {
-        Ok(postcard::from_bytes(bytes)?)
     }
 }

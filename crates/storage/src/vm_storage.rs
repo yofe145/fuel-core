@@ -3,10 +3,12 @@
 use crate::{
     not_found,
     tables::{
+        ConsensusParametersVersions,
         ContractsAssets,
         ContractsRawCode,
         ContractsState,
         FuelBlocks,
+        StateTransitionBytecodeVersions,
     },
     ContractsAssetsStorage,
     ContractsStateKey,
@@ -24,10 +26,16 @@ use crate::{
 use anyhow::anyhow;
 use fuel_core_types::{
     blockchain::{
-        header::ConsensusHeader,
+        header::{
+            ApplicationHeader,
+            ConsensusHeader,
+            ConsensusParametersVersion,
+            StateTransitionBytecodeVersion,
+        },
         primitives::BlockId,
     },
     fuel_tx::{
+        ConsensusParameters,
         Contract,
         StorageSlot,
     },
@@ -42,15 +50,32 @@ use fuel_core_types::{
 };
 use fuel_vm_private::{
     fuel_storage::StorageWrite,
-    storage::ContractsStateData,
+    storage::{
+        BlobData,
+        ContractsStateData,
+        UploadedBytecodes,
+    },
 };
 use itertools::Itertools;
 use primitive_types::U256;
+
+#[cfg(feature = "std")]
 use std::borrow::Cow;
+
+#[cfg(not(feature = "std"))]
+use alloc::borrow::Cow;
+
+#[cfg(feature = "alloc")]
+use alloc::{
+    borrow::ToOwned,
+    vec::Vec,
+};
 
 /// Used to store metadata relevant during the execution of a transaction.
 #[derive(Clone, Debug)]
 pub struct VmStorage<D> {
+    consensus_parameters_version: ConsensusParametersVersion,
+    state_transition_version: StateTransitionBytecodeVersion,
     current_block_height: BlockHeight,
     current_timestamp: Tai64,
     coinbase: ContractId,
@@ -77,6 +102,8 @@ impl IncreaseStorageKey for U256 {
 impl<D: Default> Default for VmStorage<D> {
     fn default() -> Self {
         Self {
+            consensus_parameters_version: Default::default(),
+            state_transition_version: Default::default(),
             current_block_height: Default::default(),
             current_timestamp: Tai64::now(),
             coinbase: Default::default(),
@@ -87,14 +114,17 @@ impl<D: Default> Default for VmStorage<D> {
 
 impl<D> VmStorage<D> {
     /// Create and instance of the VM storage around the `header` and `coinbase` contract id.
-    pub fn new<T>(
+    pub fn new<C, A>(
         database: D,
-        header: &ConsensusHeader<T>,
+        consensus: &ConsensusHeader<C>,
+        application: &ApplicationHeader<A>,
         coinbase: ContractId,
     ) -> Self {
         Self {
-            current_block_height: header.height,
-            current_timestamp: header.time,
+            consensus_parameters_version: application.consensus_parameters_version,
+            state_transition_version: application.state_transition_bytecode_version,
+            current_block_height: consensus.height,
+            current_timestamp: consensus.time,
             coinbase,
             database,
         }
@@ -126,16 +156,24 @@ impl<D, M: Mappable> StorageMutate<M> for VmStorage<D>
 where
     D: StorageMutate<M, Error = StorageError>,
 {
-    fn insert(
+    fn insert(&mut self, key: &M::Key, value: &M::Value) -> Result<(), Self::Error> {
+        StorageMutate::<M>::insert(&mut self.database, key, value)
+    }
+
+    fn replace(
         &mut self,
         key: &M::Key,
         value: &M::Value,
     ) -> Result<Option<M::OwnedValue>, Self::Error> {
-        StorageMutate::<M>::insert(&mut self.database, key, value)
+        StorageMutate::<M>::replace(&mut self.database, key, value)
     }
 
-    fn remove(&mut self, key: &M::Key) -> Result<Option<M::OwnedValue>, Self::Error> {
+    fn remove(&mut self, key: &M::Key) -> Result<(), Self::Error> {
         StorageMutate::<M>::remove(&mut self.database, key)
+    }
+
+    fn take(&mut self, key: &M::Key) -> Result<Option<M::OwnedValue>, Self::Error> {
+        StorageMutate::<M>::take(&mut self.database, key)
     }
 }
 
@@ -168,20 +206,20 @@ impl<D, M: Mappable> StorageWrite<M> for VmStorage<D>
 where
     D: StorageWrite<M, Error = StorageError>,
 {
-    fn write(&mut self, key: &M::Key, buf: &[u8]) -> Result<usize, Self::Error> {
-        StorageWrite::<M>::write(&mut self.database, key, buf)
+    fn write_bytes(&mut self, key: &M::Key, buf: &[u8]) -> Result<usize, Self::Error> {
+        StorageWrite::<M>::write_bytes(&mut self.database, key, buf)
     }
 
-    fn replace(
+    fn replace_bytes(
         &mut self,
         key: &M::Key,
         buf: &[u8],
     ) -> Result<(usize, Option<Vec<u8>>), Self::Error> {
-        StorageWrite::<M>::replace(&mut self.database, key, buf)
+        StorageWrite::<M>::replace_bytes(&mut self.database, key, buf)
     }
 
-    fn take(&mut self, key: &M::Key) -> Result<Option<Vec<u8>>, Self::Error> {
-        StorageWrite::<M>::take(&mut self.database, key)
+    fn take_bytes(&mut self, key: &M::Key) -> Result<Option<Vec<u8>>, Self::Error> {
+        StorageWrite::<M>::take_bytes(&mut self.database, key)
     }
 }
 
@@ -208,12 +246,26 @@ where
         + StorageWrite<ContractsState, Error = StorageError>
         + StorageSize<ContractsState, Error = StorageError>
         + StorageRead<ContractsState, Error = StorageError>
+        + StorageMutate<ConsensusParametersVersions, Error = StorageError>
+        + StorageMutate<StateTransitionBytecodeVersions, Error = StorageError>
+        + StorageMutate<UploadedBytecodes, Error = StorageError>
+        + StorageWrite<BlobData, Error = StorageError>
+        + StorageSize<BlobData, Error = StorageError>
+        + StorageRead<BlobData, Error = StorageError>
         + VmStorageRequirements<Error = StorageError>,
 {
     type DataError = StorageError;
 
     fn block_height(&self) -> Result<BlockHeight, Self::DataError> {
         Ok(self.current_block_height)
+    }
+
+    fn consensus_parameters_version(&self) -> Result<u32, Self::DataError> {
+        Ok(self.consensus_parameters_version)
+    }
+
+    fn state_transition_version(&self) -> Result<u32, Self::DataError> {
+        Ok(self.state_transition_version)
     }
 
     fn timestamp(&self, height: BlockHeight) -> Result<Word, Self::DataError> {
@@ -245,6 +297,26 @@ where
 
     fn coinbase(&self) -> Result<ContractId, Self::DataError> {
         Ok(self.coinbase)
+    }
+
+    fn set_consensus_parameters(
+        &mut self,
+        version: u32,
+        consensus_parameters: &ConsensusParameters,
+    ) -> Result<Option<ConsensusParameters>, Self::DataError> {
+        self.database
+            .storage_as_mut::<ConsensusParametersVersions>()
+            .replace(&version, consensus_parameters)
+    }
+
+    fn set_state_transition_bytecode(
+        &mut self,
+        version: u32,
+        hash: &Bytes32,
+    ) -> Result<Option<Bytes32>, Self::DataError> {
+        self.database
+            .storage_as_mut::<StateTransitionBytecodeVersions>()
+            .replace(&version, hash)
     }
 
     fn deploy_contract_with_id(
@@ -306,7 +378,7 @@ where
             let option = self
                 .database
                 .storage::<ContractsState>()
-                .insert(&(contract_id, &key_bytes).into(), value)?;
+                .replace(&(contract_id, &key_bytes).into(), value)?;
 
             if option.is_none() {
                 found_unset = found_unset
@@ -337,7 +409,7 @@ where
             let option = self
                 .database
                 .storage::<ContractsState>()
-                .remove(&(contract_id, &key_bytes).into())?;
+                .take(&(contract_id, &key_bytes).into())?;
 
             found_unset |= option.is_none();
 

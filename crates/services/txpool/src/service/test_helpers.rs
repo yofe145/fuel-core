@@ -1,14 +1,19 @@
 use super::*;
 use crate::{
     mock_db::MockDBProvider,
-    ports::BlockImporter,
+    ports::{
+        BlockImporter,
+        MockConsensusParametersProvider,
+    },
+    test_helpers::MockWasmChecker,
+    types::GasPrice,
     MockDb,
+    Result as TxPoolResult,
 };
 use fuel_core_services::{
     stream::BoxStream,
     Service as ServiceTrait,
 };
-use fuel_core_txpool::types::GasPrice;
 use fuel_core_types::{
     blockchain::SealedBlock,
     entities::coins::coin::Coin,
@@ -23,6 +28,7 @@ use fuel_core_types::{
         TransactionBuilder,
         Word,
     },
+    fuel_vm::interpreter::MemoryInstance,
     services::{
         block_importer::ImportResult,
         p2p::GossipsubMessageAcceptance,
@@ -32,8 +38,26 @@ use std::cell::RefCell;
 
 type GossipedTransaction = GossipData<Transaction>;
 
+pub struct DummyPool;
+
+#[async_trait::async_trait]
+impl MemoryPool for DummyPool {
+    type Memory = MemoryInstance;
+
+    async fn get_memory(&self) -> Self::Memory {
+        MemoryInstance::new()
+    }
+}
+
 pub struct TestContext {
-    pub(crate) service: Service<MockP2P, MockDBProvider, MockTxPoolGasPrice>,
+    pub(crate) service: Service<
+        MockP2P,
+        MockDBProvider,
+        MockWasmChecker,
+        MockTxPoolGasPrice,
+        MockConsensusParametersProvider,
+        DummyPool,
+    >,
     mock_db: MockDb,
     rng: RefCell<StdRng>,
 }
@@ -55,9 +79,12 @@ impl MockTxPoolGasPrice {
     }
 }
 
+#[async_trait::async_trait]
 impl GasPriceProviderConstraint for MockTxPoolGasPrice {
-    fn gas_price(&self, _block_height: BlockHeight) -> Option<GasPrice> {
-        self.gas_price
+    async fn next_gas_price(&self) -> TxPoolResult<GasPrice> {
+        self.gas_price.ok_or(TxPoolError::GasPriceNotFound(
+            "Gas price not found".to_string(),
+        ))
     }
 }
 
@@ -66,7 +93,16 @@ impl TestContext {
         TestContextBuilder::new().build_and_start().await
     }
 
-    pub fn service(&self) -> &Service<MockP2P, MockDBProvider, MockTxPoolGasPrice> {
+    pub fn service(
+        &self,
+    ) -> &Service<
+        MockP2P,
+        MockDBProvider,
+        MockWasmChecker,
+        MockTxPoolGasPrice,
+        MockConsensusParametersProvider,
+        DummyPool,
+    > {
         &self.service
     }
 
@@ -228,14 +264,22 @@ impl TestContextBuilder {
             .importer
             .unwrap_or_else(|| MockImporter::with_blocks(vec![]));
         let gas_price_provider = MockTxPoolGasPrice::new(gas_price);
+        let mut consensus_parameters_provider =
+            MockConsensusParametersProvider::default();
+        consensus_parameters_provider
+            .expect_latest_consensus_parameters()
+            .returning(|| (0, Arc::new(Default::default())));
 
         let service = new_service(
             config,
             MockDBProvider(mock_db.clone()),
             importer,
             p2p,
+            MockWasmChecker { result: Ok(()) },
             Default::default(),
             gas_price_provider,
+            consensus_parameters_provider,
+            DummyPool,
         );
 
         TestContext {

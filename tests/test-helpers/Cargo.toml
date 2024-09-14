@@ -8,9 +8,12 @@ publish = false
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
 fuel-core = { path = "../../crates/fuel-core", default-features = false, features = [
   "test-helpers",
 ] }
+fuel-core-bin = { path = "../../bin/fuel-core", features = ["parquet", "p2p"] }
 fuel-core-client = { path = "../../crates/client", features = ["test-helpers"] }
 fuel-core-p2p = { path = "../../crates/services/p2p", features = [
   "test-helpers",
@@ -27,5 +30,9 @@ fuel-core-txpool = { path = "../../crates/services/txpool", features = [
   "test-helpers",
 ] }
 fuel-core-types = { path = "../../crates/types", features = ["test-helpers"] }
+futures = { workspace = true }
 itertools = { workspace = true }
 rand = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+tempfile = { workspace = true }

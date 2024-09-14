@@ -20,6 +20,7 @@ use fuel_core::{
     database::{
         balances::BalancesInitializer,
         state::StateInitializer,
+        Database,
     },
     service::{
         config::Trigger,
@@ -33,11 +34,10 @@ use fuel_core_benches::{
     *,
 };
 use fuel_core_chain_config::{
+    ChainConfig,
     ContractConfig,
     StateConfig,
-    StateReader,
 };
-use fuel_core_services::Service;
 use fuel_core_storage::{
     tables::ContractsRawCode,
     vm_storage::IncreaseStorageKey,
@@ -64,9 +64,12 @@ use fuel_core_types::{
     },
     fuel_tx::{
         ContractIdExt,
+        FeeParameters,
         GasCosts,
         Input,
         Output,
+        PredicateParameters,
+        TxParameters,
         TxPointer,
         UniqueIdentifier,
         UtxoId,
@@ -79,6 +82,7 @@ use fuel_core_types::{
     fuel_vm::{
         checked_transaction::EstimatePredicates,
         consts::WORD_SIZE,
+        interpreter::MemoryInstance,
     },
     services::executor::TransactionExecutionResult,
 };
@@ -261,12 +265,24 @@ fn service_with_many_contracts(
         .unwrap();
     let _drop = rt.enter();
     let mut database = Database::rocksdb_temp();
-    let mut config = Config::local_node();
-    config
-        .chain_config
+
+    let mut chain_config = ChainConfig::local_testnet();
+
+    chain_config.consensus_parameters.set_tx_params(
+        TxParameters::default().with_max_gas_per_tx(TARGET_BLOCK_GAS_LIMIT),
+    );
+    chain_config.consensus_parameters.set_predicate_params(
+        PredicateParameters::default().with_max_gas_per_predicate(TARGET_BLOCK_GAS_LIMIT),
+    );
+    chain_config
         .consensus_parameters
-        .tx_params
-        .max_gas_per_tx = TARGET_BLOCK_GAS_LIMIT;
+        .set_fee_params(FeeParameters::default().with_gas_per_byte(0));
+    chain_config
+        .consensus_parameters
+        .set_block_gas_limit(TARGET_BLOCK_GAS_LIMIT);
+    chain_config
+        .consensus_parameters
+        .set_gas_costs(GasCosts::new(default_gas_costs()));
 
     let contract_configs = contract_ids
         .iter()
@@ -275,25 +291,12 @@ fn service_with_many_contracts(
             ..Default::default()
         })
         .collect::<Vec<_>>();
+
     let state_config = StateConfig {
         contracts: contract_configs,
         ..Default::default()
     };
-    config.state_reader = StateReader::in_memory(state_config);
-
-    config
-        .chain_config
-        .consensus_parameters
-        .predicate_params
-        .max_gas_per_predicate = TARGET_BLOCK_GAS_LIMIT;
-    config.chain_config.block_gas_limit = TARGET_BLOCK_GAS_LIMIT;
-    config.chain_config.consensus_parameters.gas_costs =
-        GasCosts::new(default_gas_costs());
-    config
-        .chain_config
-        .consensus_parameters
-        .fee_params
-        .gas_per_byte = 0;
+    let mut config = Config::local_node_with_configs(chain_config, state_config);
     config.utxo_validation = false;
     config.block_production = Trigger::Instant;
 
@@ -333,12 +336,19 @@ fn service_with_many_contracts(
             .unwrap();
     }
 
-    let service = FuelService::new(
-        CombinedDatabase::new(database, Default::default(), Default::default()),
-        config.clone(),
-    )
-    .expect("Unable to start a FuelService");
-    service.start().expect("Unable to start the service");
+    let service = rt.block_on(async move {
+        FuelService::from_combined_database(
+            CombinedDatabase::new(
+                database,
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            ),
+            config.clone(),
+        )
+        .await
+        .expect("Unable to start FuelService")
+    });
     (service, rt)
 }
 
@@ -386,7 +396,7 @@ fn run_with_service_with_extra_inputs(
                     *contract_id,
                 );
                 let contract_output = Output::contract(
-                    input_count as u8,
+                    input_count as u16,
                     Bytes32::zeroed(),
                     Bytes32::zeroed(),
                 );
@@ -404,18 +414,14 @@ fn run_with_service_with_extra_inputs(
                 tx_builder.add_output(*output);
             }
             let mut tx = tx_builder.finalize_as_transaction();
+            let chain_config = shared.config.snapshot_reader.chain_config().clone();
             tx.estimate_predicates(
-                &shared
-                    .config
-                    .chain_config
-                    .consensus_parameters
-                    .clone()
-                    .into(),
+                &chain_config.consensus_parameters.clone().into(),
+                MemoryInstance::new(),
             )
             .unwrap();
             async move {
-                let tx_id =
-                    tx.id(&shared.config.chain_config.consensus_parameters.chain_id);
+                let tx_id = tx.id(&chain_config.consensus_parameters.chain_id());
 
                 let mut sub = shared.block_importer.block_importer.subscribe();
                 shared
@@ -431,8 +437,9 @@ fn run_with_service_with_extra_inputs(
                 assert_eq!(res.sealed_block.entity.transactions().len(), 2);
                 assert_eq!(res.tx_status[0].id, tx_id);
 
-                let TransactionExecutionResult::Failed { result, receipts } =
-                    &res.tx_status[0].result
+                let TransactionExecutionResult::Failed {
+                    result, receipts, ..
+                } = &res.tx_status[0].result
                 else {
                     panic!("The execution should fails with out of gas")
                 };

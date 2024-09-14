@@ -51,6 +51,9 @@ query($id: TransactionId!) {
     isScript
     isCreate
     isMint
+    isUpgrade
+    isUpload
+    isBlob
     outputs {
       __typename
       ... on CoinOutput {
@@ -93,10 +96,7 @@ query($id: TransactionId!) {
         time
       }
       ... on SuccessStatus {
-        transactionId
-        block {
-          height
-        }
+        blockHeight
         time
         programState {
           returnType
@@ -132,15 +132,14 @@ query($id: TransactionId!) {
           contractId
           subId
         }
+        totalGas
+        totalFee
       }
       ... on SqueezedOutStatus {
         reason
       }
       ... on FailureStatus {
-        transactionId
-        block {
-          height
-        }
+        blockHeight
         time
         reason
         programState {
@@ -177,6 +176,8 @@ query($id: TransactionId!) {
           contractId
           subId
         }
+        totalGas
+        totalFee
       }
     }
     witnesses
@@ -191,6 +192,20 @@ query($id: TransactionId!) {
     salt
     storageSlots
     bytecodeWitnessIndex
-    bytecodeLength
+    bytecodeRoot
+    subsectionIndex
+    subsectionsNumber
+    proofSet
+    upgradePurpose {
+      __typename
+      ... on ConsensusParametersPurpose {
+        witnessIndex
+        checksum
+      }
+      ... on StateTransitionPurpose {
+        root
+      }
+    }
+    blobId
   }
 }

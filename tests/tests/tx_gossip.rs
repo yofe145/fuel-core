@@ -1,3 +1,5 @@
+#![allow(unexpected_cfgs)] // for cfg(coverage)
+
 use fuel_core::p2p_test_helpers::{
     make_nodes,
     BootstrapSetup,
@@ -16,10 +18,7 @@ use fuel_core_types::{
         *,
     },
     fuel_vm::*,
-    services::{
-        block_importer::SharedImportResult,
-        executor::TransactionExecutionResult,
-    },
+    services::block_importer::SharedImportResult,
 };
 use futures::StreamExt;
 use rand::{
@@ -190,7 +189,8 @@ async fn test_tx_gossiping_invalid_txs(
     // Give some time to receive all invalid transactions.
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    let mut authority_blocks = authority.node.shared.block_importer.events();
+    let mut authority_blocks =
+        authority.node.shared.block_importer.events_shared_result();
 
     // Submit a valid transaction from banned sentry to an authority node.
     let valid_transaction = authority.test_transactions()[0].clone();
@@ -206,6 +206,7 @@ async fn test_tx_gossiping_invalid_txs(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(not(coverage))]
 async fn test_tx_gossiping_reserved_nodes_invalid_txs() {
     // Test verifies that gossiping of invalid transactions from reserved
     // nodes doesn't decrease its reputation.
@@ -218,7 +219,7 @@ async fn test_tx_gossiping_reserved_nodes_invalid_txs() {
     assert_eq!(result.tx_status.len(), 2);
     assert!(matches!(
         result.tx_status[0].result,
-        TransactionExecutionResult::Success { .. }
+        fuel_core_types::services::executor::TransactionExecutionResult::Success { .. }
     ));
 }
 

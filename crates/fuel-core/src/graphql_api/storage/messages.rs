@@ -1,10 +1,15 @@
+use fuel_core_chain_config::{
+    AddTable,
+    AsTable,
+    StateConfig,
+    StateConfigBuilder,
+    TableEntry,
+};
 use fuel_core_storage::{
     blueprint::plain::Plain,
     codec::{
-        manual::Manual,
         postcard::Postcard,
-        Decode,
-        Encode,
+        raw::Raw,
     },
     structured_storage::TableWithBlueprint,
     Mappable,
@@ -20,7 +25,6 @@ use rand::{
     },
     Rng,
 };
-use std::borrow::Cow;
 
 fuel_core_types::fuel_vm::double_key!(OwnedMessageKey, Address, address, Nonce, nonce);
 
@@ -44,23 +48,8 @@ impl Mappable for OwnedMessageIds {
     type OwnedValue = Self::Value;
 }
 
-impl Encode<OwnedMessageKey> for Manual<OwnedMessageKey> {
-    type Encoder<'a> = Cow<'a, [u8]>;
-
-    fn encode(t: &OwnedMessageKey) -> Self::Encoder<'_> {
-        Cow::Borrowed(t.as_ref())
-    }
-}
-
-impl Decode<OwnedMessageKey> for Manual<OwnedMessageKey> {
-    fn decode(bytes: &[u8]) -> anyhow::Result<OwnedMessageKey> {
-        OwnedMessageKey::from_slice(bytes)
-            .map_err(|_| anyhow::anyhow!("Unable to decode bytes"))
-    }
-}
-
 impl TableWithBlueprint for OwnedMessageIds {
-    type Blueprint = Plain<Manual<OwnedMessageKey>, Postcard>;
+    type Blueprint = Plain<Raw, Postcard>;
     type Column = super::Column;
 
     fn column() -> Self::Column {
@@ -73,4 +62,42 @@ fuel_core_storage::basic_storage_tests!(
     OwnedMessageIds,
     <OwnedMessageIds as Mappable>::Key::default(),
     <OwnedMessageIds as Mappable>::Value::default()
+);
+
+/// The storage table that indicates if the message is spent or not.
+pub struct SpentMessages;
+
+impl Mappable for SpentMessages {
+    type Key = Self::OwnedKey;
+    type OwnedKey = Nonce;
+    type Value = Self::OwnedValue;
+    type OwnedValue = ();
+}
+
+impl TableWithBlueprint for SpentMessages {
+    type Blueprint = Plain<Raw, Postcard>;
+    type Column = super::Column;
+
+    fn column() -> Self::Column {
+        Self::Column::SpentMessages
+    }
+}
+
+impl AsTable<SpentMessages> for StateConfig {
+    fn as_table(&self) -> Vec<TableEntry<SpentMessages>> {
+        Vec::new() // Do not include these for now
+    }
+}
+
+impl AddTable<SpentMessages> for StateConfigBuilder {
+    fn add(&mut self, _entries: Vec<TableEntry<SpentMessages>>) {
+        // Do not include these for now
+    }
+}
+
+#[cfg(test)]
+fuel_core_storage::basic_storage_tests!(
+    SpentMessages,
+    <SpentMessages as Mappable>::Key::default(),
+    <SpentMessages as Mappable>::Value::default()
 );

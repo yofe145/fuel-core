@@ -1,14 +1,13 @@
 use crate::{
     database::{
-        database_description::off_chain::OffChain,
-        Database,
+        OffChainIterableKeyValueView,
+        OnChainIterableKeyValueView,
     },
     fuel_core_graphql_api::storage::coins::{
         owner_coin_id_key,
         OwnedCoins,
     },
 };
-use fuel_core_chain_config::CoinConfig;
 use fuel_core_storage::{
     iter::{
         IterDirection,
@@ -28,7 +27,7 @@ use fuel_core_types::{
     },
 };
 
-impl Database<OffChain> {
+impl OffChainIterableKeyValueView {
     pub fn owned_coins_ids(
         &self,
         owner: &Address,
@@ -36,23 +35,25 @@ impl Database<OffChain> {
         direction: Option<IterDirection>,
     ) -> impl Iterator<Item = StorageResult<UtxoId>> + '_ {
         let start_coin = start_coin.map(|b| owner_coin_id_key(owner, &b));
-        self.iter_all_filtered::<OwnedCoins, _>(
-            Some(*owner), start_coin.as_ref(),
+        self.iter_all_filtered_keys::<OwnedCoins, _>(
+            Some(*owner),
+            start_coin.as_ref(),
             direction,
         )
-        // Safety: key is always 64 bytes
         .map(|res| {
-            res.map(|(key, _)| {
+            res.map(|key| {
                 UtxoId::new(
                     TxId::try_from(&key[32..64]).expect("The slice has size 32"),
-                    key[64],
+                    u16::from_be_bytes(
+                        key[64..].try_into().expect("The slice has size 2"),
+                    ),
                 )
             })
         })
     }
 }
 
-impl Database {
+impl OnChainIterableKeyValueView {
     pub fn coin(&self, utxo_id: &UtxoId) -> StorageResult<CompressedCoin> {
         let coin = self
             .storage_as_ref::<Coins>()
@@ -61,24 +62,5 @@ impl Database {
             .into_owned();
 
         Ok(coin)
-    }
-
-    pub fn iter_coin_configs(
-        &self,
-    ) -> impl Iterator<Item = StorageResult<CoinConfig>> + '_ {
-        self.iter_all::<Coins>(None)
-            .map(|raw_coin| -> StorageResult<CoinConfig> {
-                let (utxo_id, coin) = raw_coin?;
-
-                Ok(CoinConfig {
-                    tx_id: *utxo_id.tx_id(),
-                    output_index: utxo_id.output_index(),
-                    tx_pointer_block_height: coin.tx_pointer().block_height(),
-                    tx_pointer_tx_idx: coin.tx_pointer().tx_index(),
-                    owner: *coin.owner(),
-                    amount: *coin.amount(),
-                    asset_id: *coin.asset_id(),
-                })
-            })
     }
 }

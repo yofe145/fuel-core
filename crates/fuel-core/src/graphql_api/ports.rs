@@ -6,13 +6,13 @@ use fuel_core_storage::{
         IterDirection,
     },
     tables::{
+        BlobData,
         Coins,
         ContractsAssets,
         ContractsRawCode,
-        FuelBlocks,
         Messages,
-        SealedBlockConsensus,
-        Transactions,
+        StateTransitionBytecodeVersions,
+        UploadedBytecodes,
     },
     Error as StorageError,
     Result as StorageResult,
@@ -22,16 +22,23 @@ use fuel_core_txpool::service::TxStatusMessage;
 use fuel_core_types::{
     blockchain::{
         block::CompressedBlock,
+        consensus::Consensus,
+        header::ConsensusParametersVersion,
         primitives::{
             BlockId,
             DaBlockHeight,
         },
     },
-    entities::message::{
-        MerkleProof,
-        Message,
+    entities::relayer::{
+        message::{
+            MerkleProof,
+            Message,
+        },
+        transaction::RelayedTransactionStatus,
     },
     fuel_tx::{
+        Bytes32,
+        ConsensusParameters,
         Salt,
         Transaction,
         TxId,
@@ -45,6 +52,7 @@ use fuel_core_types::{
         ContractId,
         Nonce,
     },
+    fuel_vm::interpreter::Memory,
     services::{
         executor::TransactionExecutionStatus,
         graphql_api::ContractBalance,
@@ -85,6 +93,25 @@ pub trait OffChainDatabase: Send + Sync {
     ) -> BoxedIter<StorageResult<(TxPointer, TxId)>>;
 
     fn contract_salt(&self, contract_id: &ContractId) -> StorageResult<Salt>;
+
+    fn old_block(&self, height: &BlockHeight) -> StorageResult<CompressedBlock>;
+
+    fn old_blocks(
+        &self,
+        height: Option<BlockHeight>,
+        direction: IterDirection,
+    ) -> BoxedIter<'_, StorageResult<CompressedBlock>>;
+
+    fn old_block_consensus(&self, height: &BlockHeight) -> StorageResult<Consensus>;
+
+    fn old_transaction(&self, id: &TxId) -> StorageResult<Option<Transaction>>;
+
+    fn relayed_tx_status(
+        &self,
+        id: Bytes32,
+    ) -> StorageResult<Option<RelayedTransactionStatus>>;
+
+    fn message_is_spent(&self, nonce: &Nonce) -> StorageResult<bool>;
 }
 
 /// The on chain database port expected by GraphQL API service.
@@ -92,9 +119,11 @@ pub trait OnChainDatabase:
     Send
     + Sync
     + DatabaseBlocks
-    + StorageInspect<Transactions, Error = StorageError>
     + DatabaseMessages
     + StorageInspect<Coins, Error = StorageError>
+    + StorageInspect<BlobData, Error = StorageError>
+    + StorageInspect<StateTransitionBytecodeVersions, Error = StorageError>
+    + StorageInspect<UploadedBytecodes, Error = StorageError>
     + DatabaseContracts
     + DatabaseChain
     + DatabaseMessageProof
@@ -102,10 +131,13 @@ pub trait OnChainDatabase:
 }
 
 /// Trait that specifies all the getters required for blocks.
-pub trait DatabaseBlocks:
-    StorageInspect<FuelBlocks, Error = StorageError>
-    + StorageInspect<SealedBlockConsensus, Error = StorageError>
-{
+pub trait DatabaseBlocks {
+    /// Get a transaction by its id.
+    fn transaction(&self, tx_id: &TxId) -> StorageResult<Transaction>;
+
+    /// Get a block by its height.
+    fn block(&self, height: &BlockHeight) -> StorageResult<CompressedBlock>;
+
     fn blocks(
         &self,
         height: Option<BlockHeight>,
@@ -113,6 +145,9 @@ pub trait DatabaseBlocks:
     ) -> BoxedIter<'_, StorageResult<CompressedBlock>>;
 
     fn latest_height(&self) -> StorageResult<BlockHeight>;
+
+    /// Get the consensus for a block.
+    fn consensus(&self, id: &BlockHeight) -> StorageResult<Consensus>;
 }
 
 /// Trait that specifies all the getters required for messages.
@@ -123,9 +158,14 @@ pub trait DatabaseMessages: StorageInspect<Messages, Error = StorageError> {
         direction: IterDirection,
     ) -> BoxedIter<'_, StorageResult<Message>>;
 
-    fn message_is_spent(&self, nonce: &Nonce) -> StorageResult<bool>;
-
     fn message_exists(&self, nonce: &Nonce) -> StorageResult<bool>;
+}
+
+pub trait DatabaseRelayedTransactions {
+    fn transaction_status(
+        &self,
+        id: Bytes32,
+    ) -> StorageResult<Option<RelayedTransactionStatus>>;
 }
 
 /// Trait that specifies all the getters required for contract.
@@ -170,6 +210,7 @@ pub trait BlockProducerPort: Send + Sync {
         transactions: Vec<Transaction>,
         height: Option<BlockHeight>,
         utxo_validation: Option<bool>,
+        gas_price: Option<u64>,
     ) -> anyhow::Result<Vec<TransactionExecutionStatus>>;
 }
 
@@ -202,15 +243,37 @@ pub trait P2pPort: Send + Sync {
 #[async_trait::async_trait]
 pub trait GasPriceEstimate: Send + Sync {
     /// The worst case scenario for gas price at a given horizon
-    async fn worst_case_gas_price(&self, height: BlockHeight) -> u64;
+    async fn worst_case_gas_price(&self, height: BlockHeight) -> Option<u64>;
+}
+
+/// Trait for getting VM memory.
+#[async_trait::async_trait]
+pub trait MemoryPool {
+    type Memory: Memory + Send + Sync + 'static;
+
+    /// Get the memory instance.
+    async fn get_memory(&self) -> Self::Memory;
 }
 
 pub mod worker {
     use super::super::storage::blocks::FuelBlockIdsToHeights;
-    use crate::fuel_core_graphql_api::storage::{
-        coins::OwnedCoins,
-        contracts::ContractsInfo,
-        messages::OwnedMessageIds,
+    use crate::{
+        fuel_core_graphql_api::storage::{
+            coins::OwnedCoins,
+            contracts::ContractsInfo,
+            messages::{
+                OwnedMessageIds,
+                SpentMessages,
+            },
+        },
+        graphql_api::storage::{
+            old::{
+                OldFuelBlockConsensus,
+                OldFuelBlocks,
+                OldTransactions,
+            },
+            relayed_transactions::RelayedTransactionStatuses,
+        },
     };
     use fuel_core_services::stream::BoxStream;
     use fuel_core_storage::{
@@ -230,20 +293,33 @@ pub mod worker {
         },
     };
 
-    pub trait Transactional: Send + Sync {
-        type Transaction<'a>: OffChainDatabase
+    pub trait OnChainDatabase: Send + Sync {
+        /// Returns the latest block height.
+        fn latest_height(&self) -> StorageResult<Option<BlockHeight>>;
+    }
+
+    pub trait OffChainDatabase: Send + Sync {
+        type Transaction<'a>: OffChainDatabaseTransaction
         where
             Self: 'a;
+
+        /// Returns the latest block height.
+        fn latest_height(&self) -> StorageResult<Option<BlockHeight>>;
 
         /// Creates a write database transaction.
         fn transaction(&mut self) -> Self::Transaction<'_>;
     }
 
-    pub trait OffChainDatabase:
+    pub trait OffChainDatabaseTransaction:
         StorageMutate<OwnedMessageIds, Error = StorageError>
         + StorageMutate<OwnedCoins, Error = StorageError>
         + StorageMutate<FuelBlockIdsToHeights, Error = StorageError>
         + StorageMutate<ContractsInfo, Error = StorageError>
+        + StorageMutate<OldFuelBlocks, Error = StorageError>
+        + StorageMutate<OldFuelBlockConsensus, Error = StorageError>
+        + StorageMutate<OldTransactions, Error = StorageError>
+        + StorageMutate<SpentMessages, Error = StorageError>
+        + StorageMutate<RelayedTransactionStatuses, Error = StorageError>
     {
         fn record_tx_id_owner(
             &mut self,
@@ -251,7 +327,7 @@ pub mod worker {
             block_height: BlockHeight,
             tx_idx: u16,
             tx_id: &Bytes32,
-        ) -> StorageResult<Option<Bytes32>>;
+        ) -> StorageResult<()>;
 
         fn update_tx_status(
             &mut self,
@@ -263,13 +339,22 @@ pub mod worker {
         /// Returns the total count after the update.
         fn increase_tx_count(&mut self, new_txs_count: u64) -> StorageResult<u64>;
 
+        /// Gets the total number of transactions on the chain from metadata.
+        fn get_tx_count(&self) -> StorageResult<u64>;
+
         /// Commits the underlying changes into the database.
         fn commit(self) -> StorageResult<()>;
     }
 
-    pub trait BlockImporter {
+    pub trait BlockImporter: Send + Sync {
         /// Returns a stream of imported block.
         fn block_events(&self) -> BoxStream<SharedImportResult>;
+
+        /// Return the import result at the given height.
+        fn block_event_at_height(
+            &self,
+            height: Option<BlockHeight>,
+        ) -> anyhow::Result<SharedImportResult>;
     }
 
     pub trait TxPool: Send + Sync {
@@ -281,4 +366,14 @@ pub mod worker {
             status: TransactionStatus,
         );
     }
+}
+
+pub trait ConsensusProvider: Send + Sync {
+    /// Returns latest consensus parameters.
+    fn latest_consensus_params(&self) -> Arc<ConsensusParameters>;
+
+    fn consensus_params_at_version(
+        &self,
+        version: &ConsensusParametersVersion,
+    ) -> anyhow::Result<Arc<ConsensusParameters>>;
 }

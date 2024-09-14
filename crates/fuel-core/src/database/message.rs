@@ -1,35 +1,33 @@
 use crate::{
     database::{
-        database_description::off_chain::OffChain,
-        Database,
+        OffChainIterableKeyValueView,
+        OnChainIterableKeyValueView,
     },
     fuel_core_graphql_api::storage::messages::{
         OwnedMessageIds,
         OwnedMessageKey,
+        SpentMessages,
     },
 };
-use fuel_core_chain_config::MessageConfig;
+use fuel_core_chain_config::TableEntry;
 use fuel_core_storage::{
     iter::{
         IterDirection,
         IteratorOverTable,
     },
-    tables::{
-        Messages,
-        SpentMessages,
-    },
-    Error as StorageError,
+    tables::Messages,
     Result as StorageResult,
 };
 use fuel_core_types::{
-    entities::message::Message,
+    entities::relayer::message::Message,
     fuel_types::{
         Address,
         Nonce,
     },
 };
+use itertools::Itertools;
 
-impl Database<OffChain> {
+impl OffChainIterableKeyValueView {
     pub fn owned_message_ids(
         &self,
         owner: &Address,
@@ -38,16 +36,20 @@ impl Database<OffChain> {
     ) -> impl Iterator<Item = StorageResult<Nonce>> + '_ {
         let start_message_id =
             start_message_id.map(|msg_id| OwnedMessageKey::new(owner, &msg_id));
-        self.iter_all_filtered::<OwnedMessageIds, _>(
+        self.iter_all_filtered_keys::<OwnedMessageIds, _>(
             Some(*owner),
             start_message_id.as_ref(),
             direction,
         )
-        .map(|res| res.map(|(key, _)| *key.nonce()))
+        .map(|res| res.map(|key| *key.nonce()))
+    }
+
+    pub fn message_is_spent(&self, id: &Nonce) -> StorageResult<bool> {
+        fuel_core_storage::StorageAsRef::storage::<SpentMessages>(&self).contains_key(id)
     }
 }
 
-impl Database {
+impl OnChainIterableKeyValueView {
     pub fn all_messages(
         &self,
         start: Option<Nonce>,
@@ -57,38 +59,11 @@ impl Database {
             .map(|res| res.map(|(_, message)| message))
     }
 
-    pub fn iter_message_configs(
+    pub fn iter_messages(
         &self,
-    ) -> impl Iterator<Item = StorageResult<MessageConfig>> + '_ {
-        self.all_messages(None, None)
-            .filter_map(|msg| {
-                // Return only unspent messages
-                if let Ok(msg) = msg {
-                    match self.message_is_spent(msg.id()) {
-                        Ok(false) => Some(Ok(msg)),
-                        Ok(true) => None,
-                        Err(e) => Some(Err(e)),
-                    }
-                } else {
-                    Some(msg.map_err(StorageError::from))
-                }
-            })
-            .map(|msg| -> StorageResult<MessageConfig> {
-                let msg = msg?;
-
-                Ok(MessageConfig {
-                    sender: *msg.sender(),
-                    recipient: *msg.recipient(),
-                    nonce: *msg.nonce(),
-                    amount: msg.amount(),
-                    data: msg.data().clone(),
-                    da_height: msg.da_height(),
-                })
-            })
-    }
-
-    pub fn message_is_spent(&self, id: &Nonce) -> StorageResult<bool> {
-        fuel_core_storage::StorageAsRef::storage::<SpentMessages>(&self).contains_key(id)
+    ) -> impl Iterator<Item = StorageResult<TableEntry<Messages>>> + '_ {
+        self.iter_all_by_start::<Messages>(None, None)
+            .map_ok(|(key, value)| TableEntry { key, value })
     }
 
     pub fn message_exists(&self, id: &Nonce) -> StorageResult<bool> {

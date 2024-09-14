@@ -7,6 +7,7 @@
 
 mod service;
 mod state;
+mod sync;
 
 /// Re-exports for streaming utilities
 pub mod stream {
@@ -39,16 +40,37 @@ pub mod stream {
     impl<S> IntoBoxStream for S where S: Stream + Send + Sync + 'static {}
 }
 
+/// Helper trait to trace errors
+pub trait TraceErr {
+    /// Trace an error with a message.
+    fn trace_err(self, msg: &str) -> Self;
+}
+
+impl<T, E> TraceErr for Result<T, E>
+where
+    E: Display,
+{
+    fn trace_err(self, msg: &str) -> Self {
+        if let Err(e) = &self {
+            tracing::error!("{} {}", msg, e);
+        }
+        self
+    }
+}
+
 pub use service::{
     EmptyShared,
     RunnableService,
     RunnableTask,
     Service,
     ServiceRunner,
-    Shared,
-    SharedMutex,
 };
 pub use state::{
     State,
     StateWatcher,
+};
+use std::fmt::Display;
+pub use sync::{
+    Shared,
+    SharedMutex,
 };

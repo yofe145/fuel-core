@@ -29,6 +29,9 @@ use fuel_core_types::{
 use std::borrow::Cow;
 
 pub trait BlockProducerDatabase: Send + Sync {
+    /// Returns the latest block height.
+    fn latest_height(&self) -> Option<BlockHeight>;
+
     /// Gets the committed block at the `height`.
     fn get_block(&self, height: &BlockHeight) -> StorageResult<Cow<CompressedBlock>>;
 
@@ -61,18 +64,20 @@ pub trait TxPool: Send + Sync {
 
 #[async_trait::async_trait]
 pub trait Relayer: Send + Sync {
-    /// Wait for the relayer to reach at least this height and return the
-    /// latest height (which is guaranteed to be >= height).
-    async fn wait_for_at_least(
+    /// Wait for the relayer to reach at least this height and return the latest height.
+    async fn wait_for_at_least_height(
         &self,
         height: &DaBlockHeight,
     ) -> anyhow::Result<DaBlockHeight>;
+
+    /// Get the total Forced Transaction gas cost for the block at the given height.
+    async fn get_cost_for_block(&self, height: &DaBlockHeight) -> anyhow::Result<u64>;
 }
 
-pub trait Executor<TxSource>: Send + Sync {
+pub trait BlockProducer<TxSource>: Send + Sync {
     /// Executes the block and returns the result of execution with uncommitted database
     /// transaction.
-    fn execute_without_commit(
+    fn produce_without_commit(
         &self,
         component: Components<TxSource>,
     ) -> ExecutorResult<UncommittedResult<Changes>>;

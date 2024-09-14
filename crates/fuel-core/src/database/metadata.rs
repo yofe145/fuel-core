@@ -42,7 +42,7 @@ where
     }
 }
 
-impl<Description> Database<Description>
+impl<Description, Stage> Database<Description, Stage>
 where
     Description: DatabaseDescription,
     Self: StorageInspect<MetadataTable<Description>, Error = StorageError>,
@@ -65,7 +65,9 @@ where
         Ok(())
     }
 
-    pub fn latest_height(&self) -> StorageResult<Option<Description::Height>> {
+    pub fn latest_height_from_metadata(
+        &self,
+    ) -> StorageResult<Option<Description::Height>> {
         let metadata = self.storage::<MetadataTable<Description>>().get(&())?;
 
         let metadata = metadata.map(|metadata| *metadata.height());

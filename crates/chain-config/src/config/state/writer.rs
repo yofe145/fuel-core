@@ -1,16 +1,13 @@
 use crate::{
-    config::contract_state::ContractStateConfig,
-    CoinConfig,
-    ContractBalanceConfig,
-    ContractConfig,
-    MessageConfig,
+    config::table_entry::TableEntry,
+    AddTable,
+    ChainConfig,
+    LastBlockConfig,
     SnapshotMetadata,
-    StateConfig,
+    StateConfigBuilder,
+    TableEncoding,
 };
-use fuel_core_types::{
-    blockchain::primitives::DaBlockHeight,
-    fuel_types::BlockHeight,
-};
+use fuel_core_storage::structured_storage::TableWithBlueprint;
 use std::path::PathBuf;
 
 #[cfg(feature = "parquet")]
@@ -18,22 +15,17 @@ use super::parquet;
 
 enum EncoderType {
     Json {
-        buffer: StateConfig,
-        state_file_path: PathBuf,
+        builder: StateConfigBuilder,
     },
     #[cfg(feature = "parquet")]
     Parquet {
-        coins: parquet::encode::PostcardEncoder<CoinConfig>,
-        messages: parquet::encode::PostcardEncoder<MessageConfig>,
-        contracts: parquet::encode::PostcardEncoder<ContractConfig>,
-        contract_state: parquet::encode::PostcardEncoder<ContractStateConfig>,
-        contract_balance: parquet::encode::PostcardEncoder<ContractBalanceConfig>,
-        block_height: parquet::encode::PostcardEncoder<BlockHeight>,
-        da_block_height: parquet::encode::PostcardEncoder<DaBlockHeight>,
+        compression: ZstdCompressionLevel,
+        table_encoders: TableEncoders,
     },
 }
 
-pub struct StateWriter {
+pub struct SnapshotWriter {
+    dir: PathBuf,
     encoder: EncoderType,
 }
 
@@ -157,223 +149,346 @@ impl From<ZstdCompressionLevel> for ::parquet::basic::Compression {
     }
 }
 
-impl StateWriter {
-    pub fn for_snapshot(snapshot_metadata: &SnapshotMetadata) -> anyhow::Result<Self> {
-        let encoder = match snapshot_metadata.state_encoding() {
-            crate::StateEncoding::Json { filepath, .. } => Self::json(filepath),
+#[derive(Debug, Clone)]
+enum FragmentData {
+    Json {
+        builder: StateConfigBuilder,
+    },
+    #[cfg(feature = "parquet")]
+    Parquet {
+        tables: std::collections::HashMap<String, PathBuf>,
+        compression: ZstdCompressionLevel,
+    },
+}
+impl FragmentData {
+    fn merge(mut self, data: FragmentData) -> anyhow::Result<Self> {
+        match (&mut self, data) {
+            (
+                FragmentData::Json { builder, .. },
+                FragmentData::Json {
+                    builder: other_builder,
+                    ..
+                },
+            ) => {
+                builder.merge(other_builder);
+            }
             #[cfg(feature = "parquet")]
-            crate::StateEncoding::Parquet {
-                filepaths,
-                compression,
-                ..
-            } => Self::parquet(filepaths, *compression)?,
+            (
+                FragmentData::Parquet {
+                    tables,
+                    compression,
+                },
+                FragmentData::Parquet {
+                    tables: their_tables,
+                    compression: their_compression,
+                },
+            ) => {
+                tables.extend(their_tables);
+                anyhow::ensure!(*compression == their_compression, "Fragments use different compressions.")
+            }
+            #[cfg(feature="parquet")]
+            (a,b) => anyhow::bail!("Fragments don't have the same encoding and cannot be merged. Fragments: {a:?} and {b:?}"),
         };
-        Ok(encoder)
+
+        Ok(self)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SnapshotFragment {
+    dir: PathBuf,
+    data: FragmentData,
+}
+
+impl SnapshotFragment {
+    pub fn merge(mut self, fragment: Self) -> anyhow::Result<Self> {
+        self.data = self.data.merge(fragment.data)?;
+        Ok(self)
     }
 
-    pub fn json(filepath: impl Into<PathBuf>) -> Self {
+    pub fn finalize(
+        self,
+        latest_block_config: Option<LastBlockConfig>,
+        chain_config: &ChainConfig,
+    ) -> anyhow::Result<SnapshotMetadata> {
+        let table_encoding = match self.data {
+            FragmentData::Json { builder } => {
+                let state_config = builder.build(latest_block_config)?;
+                std::fs::create_dir_all(&self.dir)?;
+                let state_file_path = self.dir.join("state_config.json");
+                let file = std::fs::File::create(&state_file_path)?;
+                serde_json::to_writer_pretty(file, &state_config)?;
+
+                TableEncoding::Json {
+                    filepath: state_file_path,
+                }
+            }
+            #[cfg(feature = "parquet")]
+            FragmentData::Parquet {
+                tables,
+                compression,
+            } => {
+                let latest_block_config_path =
+                    self.dir.join("latest_block_config.parquet");
+                SnapshotWriter::write_single_el_parquet(
+                    &latest_block_config_path,
+                    latest_block_config,
+                    compression,
+                )?;
+
+                TableEncoding::Parquet {
+                    tables,
+                    latest_block_config_path,
+                }
+            }
+        };
+
+        SnapshotWriter::write_chain_config_and_metadata(
+            &self.dir,
+            chain_config,
+            table_encoding,
+        )
+    }
+}
+
+impl SnapshotWriter {
+    const CHAIN_CONFIG_FILENAME: &'static str = "chain_config.json";
+    pub fn json(dir: impl Into<PathBuf>) -> Self {
         Self {
             encoder: EncoderType::Json {
-                state_file_path: filepath.into(),
-                buffer: StateConfig::default(),
+                builder: StateConfigBuilder::default(),
             },
+            dir: dir.into(),
         }
     }
 
     #[cfg(feature = "parquet")]
     pub fn parquet(
-        files: &crate::ParquetFiles,
+        dir: impl Into<::std::path::PathBuf>,
         compression_level: ZstdCompressionLevel,
     ) -> anyhow::Result<Self> {
-        use std::path::Path;
-
-        use ::parquet::basic::Compression;
-
-        fn create_encoder<T>(
-            path: &Path,
-            compression: Compression,
-        ) -> anyhow::Result<parquet::encode::PostcardEncoder<T>>
-        where
-            parquet::encode::PostcardEncode: parquet::encode::Encode<T>,
-        {
-            let file = std::fs::File::create(path)?;
-            parquet::encode::Encoder::new(file, compression)
-        }
-
-        let compression = compression_level.into();
-
-        let crate::ParquetFiles {
-            coins,
-            messages,
-            contracts,
-            contract_state,
-            contract_balance,
-            block_height,
-            da_block_height,
-        } = files;
-
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir)?;
         Ok(Self {
             encoder: EncoderType::Parquet {
-                coins: create_encoder(coins, compression)?,
-                messages: create_encoder(messages, compression)?,
-                contracts: create_encoder(contracts, compression)?,
-                contract_state: create_encoder(contract_state, compression)?,
-                contract_balance: create_encoder(contract_balance, compression)?,
-                block_height: create_encoder(block_height, compression)?,
-                da_block_height: create_encoder(da_block_height, compression)?,
+                table_encoders: TableEncoders::new(dir.clone(), compression_level),
+                compression: compression_level,
             },
+            dir,
         })
     }
 
-    pub fn write(mut self, state_config: StateConfig) -> anyhow::Result<()> {
-        self.write_coins(state_config.coins)?;
-        self.write_contracts(state_config.contracts)?;
-        self.write_messages(state_config.messages)?;
-        self.write_contract_state(state_config.contract_state)?;
-        self.write_contract_balance(state_config.contract_balance)?;
-        self.write_block_data(state_config.block_height, state_config.da_block_height)?;
-        self.close()?;
-        Ok(())
+    #[cfg(feature = "test-helpers")]
+    pub fn write_state_config(
+        mut self,
+        state_config: crate::StateConfig,
+        chain_config: &ChainConfig,
+    ) -> anyhow::Result<SnapshotMetadata> {
+        use fuel_core_storage::tables::{
+            Coins,
+            ContractsAssets,
+            ContractsLatestUtxo,
+            ContractsRawCode,
+            ContractsState,
+            Messages,
+        };
+        use fuel_core_types::fuel_vm::BlobData;
+
+        use crate::AsTable;
+
+        self.write::<Coins>(state_config.as_table())?;
+        self.write::<Messages>(state_config.as_table())?;
+        self.write::<BlobData>(state_config.as_table())?;
+        self.write::<ContractsRawCode>(state_config.as_table())?;
+        self.write::<ContractsLatestUtxo>(state_config.as_table())?;
+        self.write::<ContractsState>(state_config.as_table())?;
+        self.write::<ContractsAssets>(state_config.as_table())?;
+        self.close(state_config.last_block, chain_config)
     }
 
-    pub fn write_coins(&mut self, elements: Vec<CoinConfig>) -> anyhow::Result<()> {
+    pub fn write<T>(&mut self, elements: Vec<TableEntry<T>>) -> anyhow::Result<()>
+    where
+        T: TableWithBlueprint,
+        TableEntry<T>: serde::Serialize,
+        StateConfigBuilder: AddTable<T>,
+    {
         match &mut self.encoder {
-            EncoderType::Json { buffer: state, .. } => {
-                state.coins.extend(elements);
+            EncoderType::Json { builder, .. } => {
+                builder.add(elements);
                 Ok(())
             }
             #[cfg(feature = "parquet")]
-            EncoderType::Parquet { coins, .. } => coins.write(elements),
+            EncoderType::Parquet { table_encoders, .. } => {
+                table_encoders.encoder::<T>()?.write::<T>(elements)
+            }
         }
     }
 
-    pub fn write_contracts(
-        &mut self,
-        elements: Vec<ContractConfig>,
+    #[cfg(feature = "parquet")]
+    fn write_single_el_parquet(
+        path: &std::path::Path,
+        data: impl serde::Serialize,
+        compression: ZstdCompressionLevel,
     ) -> anyhow::Result<()> {
-        match &mut self.encoder {
-            EncoderType::Json { buffer: state, .. } => {
-                state.contracts.extend(elements);
-                Ok(())
-            }
-            #[cfg(feature = "parquet")]
-            EncoderType::Parquet { contracts, .. } => contracts.write(elements),
-        }
+        let mut encoder = parquet::encode::Encoder::new(
+            std::fs::File::create(path)?,
+            compression.into(),
+        )?;
+        encoder.write(vec![postcard::to_stdvec(&data)?])?;
+        encoder.close()
     }
 
-    pub fn write_messages(&mut self, elements: Vec<MessageConfig>) -> anyhow::Result<()> {
-        match &mut self.encoder {
-            EncoderType::Json { buffer: state, .. } => {
-                state.messages.extend(elements);
-                Ok(())
-            }
-            #[cfg(feature = "parquet")]
-            EncoderType::Parquet { messages, .. } => messages.write(elements),
-        }
+    pub fn close(
+        self,
+        latest_block_config: Option<LastBlockConfig>,
+        chain_config: &ChainConfig,
+    ) -> anyhow::Result<SnapshotMetadata> {
+        self.partial_close()?
+            .finalize(latest_block_config, chain_config)
     }
 
-    pub fn write_contract_state(
-        &mut self,
-        elements: Vec<ContractStateConfig>,
-    ) -> anyhow::Result<()> {
-        match &mut self.encoder {
-            EncoderType::Json { buffer: state, .. } => {
-                state.contract_state.extend(elements);
-                Ok(())
-            }
-            #[cfg(feature = "parquet")]
-            EncoderType::Parquet { contract_state, .. } => contract_state.write(elements),
-        }
+    fn write_chain_config_and_metadata(
+        dir: &std::path::Path,
+        chain_config: &ChainConfig,
+        table_encoding: TableEncoding,
+    ) -> anyhow::Result<SnapshotMetadata> {
+        let chain_config_path = dir.join(Self::CHAIN_CONFIG_FILENAME);
+        chain_config.write(&chain_config_path)?;
+
+        let metadata = SnapshotMetadata {
+            chain_config: chain_config_path,
+            table_encoding,
+        };
+        metadata.clone().write(dir)?;
+        Ok(metadata)
     }
 
-    pub fn write_contract_balance(
-        &mut self,
-        elements: Vec<ContractBalanceConfig>,
-    ) -> anyhow::Result<()> {
-        match &mut self.encoder {
-            EncoderType::Json { buffer: state, .. } => {
-                state.contract_balance.extend(elements);
-                Ok(())
-            }
+    pub fn partial_close(self) -> anyhow::Result<SnapshotFragment> {
+        let data = match self.encoder {
+            EncoderType::Json { builder } => FragmentData::Json { builder },
             #[cfg(feature = "parquet")]
             EncoderType::Parquet {
-                contract_balance, ..
-            } => contract_balance.write(elements),
-        }
-    }
-
-    pub fn write_block_data(
-        &mut self,
-        height: BlockHeight,
-        da_height: DaBlockHeight,
-    ) -> anyhow::Result<()> {
-        match &mut self.encoder {
-            EncoderType::Json { buffer, .. } => {
-                buffer.block_height = height;
-                buffer.da_block_height = da_height;
-                Ok(())
-            }
-            #[cfg(feature = "parquet")]
-            EncoderType::Parquet {
-                block_height,
-                da_block_height,
+                table_encoders,
+                compression,
                 ..
             } => {
-                block_height.write(vec![height])?;
-                da_block_height.write(vec![da_height])?;
-                Ok(())
+                let tables = table_encoders.close()?;
+                FragmentData::Parquet {
+                    tables,
+                    compression,
+                }
             }
-        }
-    }
-
-    pub fn close(self) -> anyhow::Result<()> {
-        match self.encoder {
-            EncoderType::Json {
-                buffer,
-                state_file_path,
-            } => {
-                let file = std::fs::File::create(state_file_path)?;
-                serde_json::to_writer_pretty(file, &buffer)?;
-                Ok(())
-            }
-            #[cfg(feature = "parquet")]
-            EncoderType::Parquet {
-                coins,
-                messages,
-                contracts,
-                contract_state,
-                contract_balance,
-                block_height,
-                da_block_height,
-            } => {
-                coins.close()?;
-                messages.close()?;
-                contracts.close()?;
-                contract_state.close()?;
-                contract_balance.close()?;
-                block_height.close()?;
-                da_block_height.close()?;
-                Ok(())
-            }
-        }
+        };
+        let snapshot_fragment = SnapshotFragment {
+            dir: self.dir,
+            data,
+        };
+        Ok(snapshot_fragment)
     }
 }
 
-#[cfg(feature = "random")]
+#[cfg(feature = "parquet")]
+struct PostcardParquetEncoder {
+    path: PathBuf,
+    encoder: parquet::encode::Encoder<std::fs::File>,
+}
+
+#[cfg(feature = "parquet")]
+impl PostcardParquetEncoder {
+    pub fn new(path: PathBuf, encoder: parquet::encode::Encoder<std::fs::File>) -> Self {
+        Self { path, encoder }
+    }
+
+    fn write<T>(&mut self, elements: Vec<TableEntry<T>>) -> anyhow::Result<()>
+    where
+        T: fuel_core_storage::Mappable,
+        TableEntry<T>: serde::Serialize,
+    {
+        use itertools::Itertools;
+        let encoded: Vec<_> = elements
+            .into_iter()
+            .map(|entry| postcard::to_stdvec(&entry))
+            .try_collect()?;
+        self.encoder.write(encoded)
+    }
+}
+
+#[cfg(feature = "parquet")]
+struct TableEncoders {
+    dir: PathBuf,
+    compression: ZstdCompressionLevel,
+    encoders: std::collections::HashMap<String, PostcardParquetEncoder>,
+}
+
+#[cfg(feature = "parquet")]
+impl TableEncoders {
+    fn new(dir: PathBuf, compression: ZstdCompressionLevel) -> Self {
+        Self {
+            dir,
+            compression,
+            encoders: Default::default(),
+        }
+    }
+
+    fn encoder<T: fuel_core_storage::structured_storage::TableWithBlueprint>(
+        &mut self,
+    ) -> anyhow::Result<&mut PostcardParquetEncoder> {
+        use fuel_core_storage::kv_store::StorageColumn;
+
+        let name = StorageColumn::name(&T::column()).to_string();
+
+        let encoder = match self.encoders.entry(name) {
+            std::collections::hash_map::Entry::Occupied(encoder) => encoder.into_mut(),
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                let name = vacant.key();
+                let file_path = self.dir.join(format!("{name}.parquet"));
+                let file = std::fs::File::create(&file_path)?;
+                let encoder = PostcardParquetEncoder::new(
+                    file_path,
+                    parquet::encode::Encoder::new(file, self.compression.into())?,
+                );
+                vacant.insert(encoder)
+            }
+        };
+
+        Ok(encoder)
+    }
+
+    fn close(self) -> anyhow::Result<std::collections::HashMap<String, PathBuf>> {
+        let mut files = std::collections::HashMap::new();
+        for (file, encoder) in self.encoders {
+            encoder.encoder.close()?;
+            files.insert(file, encoder.path);
+        }
+        Ok(files)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use fuel_core_types::{
-        blockchain::primitives::DaBlockHeight,
-        fuel_types::{
-            BlockHeight,
-            Nonce,
+    use std::path::Path;
+
+    use fuel_core_storage::{
+        kv_store::StorageColumn,
+        structured_storage::TableWithBlueprint,
+        tables::{
+            Coins,
+            ContractsAssets,
+            ContractsLatestUtxo,
+            ContractsRawCode,
+            ContractsState,
+            Messages,
         },
     };
+    use rand::{
+        rngs::StdRng,
+        SeedableRng,
+    };
+
+    use crate::StateConfig;
 
     use super::*;
-    use itertools::Itertools;
 
-    #[cfg(feature = "parquet")]
     #[test]
     fn can_roundtrip_compression_level() {
         use strum::IntoEnumIterator;
@@ -386,128 +501,46 @@ mod tests {
     }
 
     #[test]
-    fn json_encoder_generates_single_file_with_expected_name() {
-        // given
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("state_config.json");
-        let encoder = StateWriter::json(&file);
+    fn parquet_encoder_encodes_tables_in_expected_files() {
+        fn file_created_and_present_in_metadata<T>()
+        where
+            T: TableWithBlueprint,
+            T::OwnedKey: serde::Serialize,
+            T::OwnedValue: serde::Serialize,
+            StateConfigBuilder: AddTable<T>,
+        {
+            // given
+            use pretty_assertions::assert_eq;
 
-        // when
-        encoder.close().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let mut writer =
+                SnapshotWriter::parquet(dir.path(), ZstdCompressionLevel::Uncompressed)
+                    .unwrap();
 
-        // then
-        let entries: Vec<_> = dir.path().read_dir().unwrap().try_collect().unwrap();
+            // when
+            writer.write::<T>(vec![]).unwrap();
+            let snapshot = writer.close(None, &ChainConfig::local_testnet()).unwrap();
 
-        match entries.as_slice() {
-            [entry] => assert_eq!(entry.path(), file),
-            _ => panic!("Expected single file \"state_config.json\""),
+            // then
+            assert!(snapshot.chain_config.exists());
+            let TableEncoding::Parquet { tables, .. } = snapshot.table_encoding else {
+                panic!("Expected parquet encoding")
+            };
+            assert_eq!(tables.len(), 1, "Expected single table");
+            let (table_name, path) = tables.into_iter().next().unwrap();
+
+            assert_eq!(table_name, T::column().name());
+            assert!(dir.path().join(path).exists());
         }
+
+        file_created_and_present_in_metadata::<Coins>();
+        file_created_and_present_in_metadata::<Messages>();
+        file_created_and_present_in_metadata::<ContractsRawCode>();
+        file_created_and_present_in_metadata::<ContractsLatestUtxo>();
+        file_created_and_present_in_metadata::<ContractsState>();
+        file_created_and_present_in_metadata::<ContractsAssets>();
     }
 
-    #[cfg(feature = "parquet")]
-    #[test]
-    fn parquet_encoder_generates_expected_filenames() {
-        // given
-        let dir = tempfile::tempdir().unwrap();
-        let files = crate::ParquetFiles::snapshot_default(dir.path());
-        let encoder =
-            StateWriter::parquet(&files, ZstdCompressionLevel::Uncompressed).unwrap();
-
-        // when
-        encoder.close().unwrap();
-
-        // then
-        let entries: std::collections::HashSet<_> = dir
-            .path()
-            .read_dir()
-            .unwrap()
-            .map_ok(|entry| entry.path())
-            .try_collect()
-            .unwrap();
-        let expected_files = std::collections::HashSet::from(
-            [
-                "coins.parquet",
-                "messages.parquet",
-                "contracts.parquet",
-                "contract_state.parquet",
-                "contract_balance.parquet",
-                "block_height.parquet",
-                "da_block_height.parquet",
-            ]
-            .map(|name| dir.path().join(name)),
-        );
-
-        assert_eq!(entries, expected_files);
-    }
-
-    #[cfg(feature = "parquet")]
-    #[test]
-    fn parquet_encoder_encodes_types_in_expected_files() {
-        use rand::SeedableRng;
-        let mut rng = rand::rngs::StdRng::seed_from_u64(0);
-
-        test_data_written_in_expected_file::<CoinConfig>(
-            &mut rng,
-            "coins.parquet",
-            |coins, encoder| encoder.write_coins(coins),
-        );
-
-        test_data_written_in_expected_file::<MessageConfig>(
-            &mut rng,
-            "messages.parquet",
-            |coins, encoder| encoder.write_messages(coins),
-        );
-
-        test_data_written_in_expected_file::<ContractConfig>(
-            &mut rng,
-            "contracts.parquet",
-            |coins, encoder| encoder.write_contracts(coins),
-        );
-
-        test_data_written_in_expected_file::<ContractStateConfig>(
-            &mut rng,
-            "contract_state.parquet",
-            |coins, encoder| encoder.write_contract_state(coins),
-        );
-
-        test_data_written_in_expected_file::<ContractBalanceConfig>(
-            &mut rng,
-            "contract_balance.parquet",
-            |coins, encoder| encoder.write_contract_balance(coins),
-        );
-    }
-
-    #[cfg(feature = "parquet")]
-    fn test_data_written_in_expected_file<T>(
-        rng: impl rand::Rng,
-        expected_filename: &str,
-        write: impl FnOnce(Vec<T>, &mut StateWriter) -> anyhow::Result<()>,
-    ) where
-        parquet::decode::PostcardDecoder<T>:
-            Iterator<Item = anyhow::Result<crate::Group<T>>>,
-        T: crate::Randomize + PartialEq + ::core::fmt::Debug + Clone,
-    {
-        // given
-        let dir = tempfile::tempdir().unwrap();
-        let files = crate::ParquetFiles::snapshot_default(dir.path());
-        let mut encoder =
-            StateWriter::parquet(&files, ZstdCompressionLevel::Uncompressed).unwrap();
-        let original_data = vec![T::randomize(rng)];
-
-        // when
-        write(original_data.clone(), &mut encoder).unwrap();
-        encoder.close().unwrap();
-
-        // then
-        let file = std::fs::File::open(dir.path().join(expected_filename)).unwrap();
-        let decoded = parquet::decode::PostcardDecoder::<T>::new(file)
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert_eq!(original_data, decoded.first().unwrap().data);
-    }
-
-    #[cfg(feature = "parquet")]
     #[test]
     fn all_compressions_are_valid() {
         use ::parquet::basic::Compression;
@@ -518,77 +551,92 @@ mod tests {
     }
 
     #[test]
-    fn json_coins_are_human_readable() {
+    fn json_snapshot_is_human_readable() {
         // given
+        use crate::Randomize;
         let dir = tempfile::tempdir().unwrap();
-        let filepath = dir.path().join("some_file.json");
-        let mut encoder = StateWriter::json(&filepath);
-        let coin = CoinConfig {
-            tx_id: [1u8; 32].into(),
-            output_index: 2,
-            tx_pointer_block_height: BlockHeight::new(3),
-            tx_pointer_tx_idx: 4,
-            owner: [6u8; 32].into(),
-            amount: 7,
-            asset_id: [8u8; 32].into(),
-        };
+        let writer = SnapshotWriter::json(dir.path());
+        let mut rng = StdRng::from_seed([0; 32]);
+        let state = StateConfig::randomize(&mut rng);
 
         // when
-        encoder.write_coins(vec![coin.clone()]).unwrap();
-        encoder.close().unwrap();
+        let snapshot = writer
+            .write_state_config(state, &ChainConfig::local_testnet())
+            .unwrap();
 
         // then
-        let encoded_json = std::fs::read_to_string(&filepath).unwrap();
-
-        insta::assert_snapshot!(encoded_json);
-    }
-
-    #[test]
-    fn json_messages_are_human_readable() {
-        // given
-        let dir = tempfile::tempdir().unwrap();
-        let filepath = dir.path().join("some_file.json");
-        let mut encoder = StateWriter::json(&filepath);
-        let message = MessageConfig {
-            sender: [1u8; 32].into(),
-            recipient: [2u8; 32].into(),
-            nonce: Nonce::new([3u8; 32]),
-            amount: 4,
-            data: [5u8; 32].into(),
-            da_height: DaBlockHeight(6),
+        let TableEncoding::Json { filepath } = snapshot.table_encoding else {
+            panic!("Expected json encoding")
         };
-
-        // when
-        encoder.write_messages(vec![message.clone()]).unwrap();
-        encoder.close().unwrap();
-
-        // then
         let encoded_json = std::fs::read_to_string(filepath).unwrap();
 
         insta::assert_snapshot!(encoded_json);
     }
 
-    #[test]
-    fn json_contracts_are_human_readable() {
+    fn given_parquet_writer(path: &Path) -> SnapshotWriter {
+        SnapshotWriter::parquet(path, ZstdCompressionLevel::Uncompressed).unwrap()
+    }
+
+    fn given_json_writer(path: &Path) -> SnapshotWriter {
+        SnapshotWriter::json(path)
+    }
+
+    #[test_case::test_case(given_parquet_writer)]
+    #[test_case::test_case(given_json_writer)]
+    fn can_partially_close_without_chain_and_block_height(
+        writer: impl Fn(&Path) -> SnapshotWriter + Copy,
+    ) {
         // given
         let dir = tempfile::tempdir().unwrap();
-        let filepath = dir.path().join("some_file.json");
-        let mut encoder = StateWriter::json(&filepath);
-        let contract = ContractConfig {
-            contract_id: [1u8; 32].into(),
-            code: [2u8; 32].into(),
-            tx_id: [4u8; 32].into(),
-            output_index: 5,
-            tx_pointer_block_height: BlockHeight::new(6),
-            tx_pointer_tx_idx: 7,
-        };
+        let writer = writer(dir.path());
 
         // when
-        encoder.write_contracts(vec![contract.clone()]).unwrap();
-        encoder.close().unwrap();
+        let result = writer.partial_close();
 
         // then
-        let encoded_json = std::fs::read_to_string(filepath).unwrap();
-        insta::assert_snapshot!(encoded_json);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn merging_json_and_parquet_fragments_fails() {
+        // given
+        let dir = tempfile::tempdir().unwrap();
+        let json_writer = super::SnapshotWriter::json(dir.path());
+        let parquet_writer = super::SnapshotWriter::parquet(
+            dir.path(),
+            super::ZstdCompressionLevel::Uncompressed,
+        );
+
+        let json_fragment = json_writer.partial_close().unwrap();
+        let parquet_fragment = parquet_writer.unwrap().partial_close().unwrap();
+
+        {
+            // when
+            let result = json_fragment.clone().merge(parquet_fragment.clone());
+
+            // when
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains(
+                "Fragments don't have the same encoding and cannot be merged."
+            ));
+        }
+        {
+            // when
+            let result = parquet_fragment.merge(json_fragment);
+
+            // when
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains(
+                "Fragments don't have the same encoding and cannot be merged."
+            ));
+        }
+    }
+
+    // It is enough just for the test to compile
+    #[test]
+    #[ignore]
+    fn fragment_must_be_send_sync() {
+        fn _assert_send<T: Send + Sync>() {}
+        _assert_send::<super::SnapshotFragment>();
     }
 }

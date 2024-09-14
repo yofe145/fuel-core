@@ -1,9 +1,14 @@
 use crate::{
-    database::Database,
-    service::adapters::{
-        BlockImporterAdapter,
-        P2PAdapter,
-        StaticGasPrice,
+    database::OnChainIterableKeyValueView,
+    service::{
+        adapters::{
+            BlockImporterAdapter,
+            ConsensusParametersProvider,
+            P2PAdapter,
+            SharedMemoryPool,
+            StaticGasPrice,
+        },
+        vm_pool::MemoryFromPool,
     },
 };
 use fuel_core_services::stream::BoxStream;
@@ -12,29 +17,36 @@ use fuel_core_storage::{
         Coins,
         ContractsRawCode,
         Messages,
-        SpentMessages,
     },
     Result as StorageResult,
     StorageAsRef,
 };
 use fuel_core_txpool::{
-    ports::BlockImporter,
-    txpool::GasPriceProvider,
+    ports::{
+        BlockImporter,
+        ConsensusParametersProvider as ConsensusParametersProviderTrait,
+        GasPriceProvider,
+        MemoryPool,
+    },
+    Result as TxPoolResult,
 };
 use fuel_core_types::{
+    blockchain::header::ConsensusParametersVersion,
     entities::{
         coins::coin::CompressedCoin,
-        message::Message,
+        relayer::message::Message,
     },
     fuel_tx::{
+        BlobId,
+        ConsensusParameters,
         Transaction,
         UtxoId,
     },
     fuel_types::{
-        BlockHeight,
         ContractId,
         Nonce,
     },
+    fuel_vm::BlobData,
     services::{
         block_importer::SharedImportResult,
         p2p::{
@@ -48,7 +60,7 @@ use std::sync::Arc;
 
 impl BlockImporter for BlockImporterAdapter {
     fn block_events(&self) -> BoxStream<SharedImportResult> {
-        self.events()
+        self.events_shared_result()
     }
 }
 
@@ -116,7 +128,7 @@ impl fuel_core_txpool::ports::PeerToPeer for P2PAdapter {
     }
 }
 
-impl fuel_core_txpool::ports::TxPoolDb for Database {
+impl fuel_core_txpool::ports::TxPoolDb for OnChainIterableKeyValueView {
     fn utxo(&self, utxo_id: &UtxoId) -> StorageResult<Option<CompressedCoin>> {
         self.storage::<Coins>()
             .get(utxo_id)
@@ -127,19 +139,37 @@ impl fuel_core_txpool::ports::TxPoolDb for Database {
         self.storage::<ContractsRawCode>().contains_key(contract_id)
     }
 
+    fn blob_exist(&self, blob_id: &BlobId) -> StorageResult<bool> {
+        self.storage::<BlobData>().contains_key(blob_id)
+    }
+
     fn message(&self, id: &Nonce) -> StorageResult<Option<Message>> {
         self.storage::<Messages>()
             .get(id)
             .map(|t| t.map(|t| t.as_ref().clone()))
     }
+}
 
-    fn is_message_spent(&self, id: &Nonce) -> StorageResult<bool> {
-        self.storage::<SpentMessages>().contains_key(id)
+#[async_trait::async_trait]
+impl GasPriceProvider for StaticGasPrice {
+    async fn next_gas_price(&self) -> TxPoolResult<u64> {
+        Ok(self.gas_price)
     }
 }
 
-impl GasPriceProvider for StaticGasPrice {
-    fn gas_price(&self, _block_height: BlockHeight) -> Option<u64> {
-        Some(self.gas_price)
+impl ConsensusParametersProviderTrait for ConsensusParametersProvider {
+    fn latest_consensus_parameters(
+        &self,
+    ) -> (ConsensusParametersVersion, Arc<ConsensusParameters>) {
+        self.shared_state.latest_consensus_parameters_with_version()
+    }
+}
+
+#[async_trait::async_trait]
+impl MemoryPool for SharedMemoryPool {
+    type Memory = MemoryFromPool;
+
+    async fn get_memory(&self) -> Self::Memory {
+        self.memory_pool.take_raw().await
     }
 }

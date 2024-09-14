@@ -1,9 +1,11 @@
 pub mod balance;
+pub mod blob;
 pub mod block;
 pub mod chain_info;
 pub mod coins;
 pub mod contract;
 pub mod gas_costs;
+pub mod upgrades;
 
 pub mod gas_price;
 pub mod merkle_proof;
@@ -11,6 +13,7 @@ pub mod message;
 pub mod node_info;
 
 pub use balance::Balance;
+pub use blob::Blob;
 pub use block::{
     Block,
     Consensus,
@@ -37,8 +40,9 @@ pub use message::{
 pub use node_info::NodeInfo;
 
 use crate::client::schema::{
+    relayed_tx::RelayedTransactionStatus as SchemaRelayedTransactionStatus,
     tx::{
-        OpaqueTransaction,
+        OpaqueTransactionWithStatus,
         TransactionStatus as SchemaTxStatus,
     },
     ConversionError,
@@ -66,6 +70,7 @@ pub mod primitives {
         fuel_types::{
             Address,
             AssetId,
+            BlobId,
             Bytes32,
             Bytes64,
             ChainId,
@@ -83,32 +88,40 @@ pub mod primitives {
     pub type TransactionId = Bytes32;
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TransactionResponse {
     pub transaction: Transaction,
     pub status: TransactionStatus,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TransactionStatus {
     Submitted {
         submitted_at: Tai64,
     },
     Success {
+        #[cfg(feature = "test-helpers")]
+        transaction: Transaction,
         block_height: BlockHeight,
         time: Tai64,
         program_state: Option<ProgramState>,
         receipts: Vec<Receipt>,
+        total_gas: u64,
+        total_fee: u64,
     },
     SqueezedOut {
         reason: String,
     },
     Failure {
+        #[cfg(feature = "test-helpers")]
+        transaction: Transaction,
         block_height: BlockHeight,
         time: Tai64,
         reason: String,
         program_state: Option<ProgramState>,
         receipts: Vec<Receipt>,
+        total_gas: u64,
+        total_fee: u64,
     },
 }
 
@@ -121,7 +134,9 @@ impl TryFrom<SchemaTxStatus> for TransactionStatus {
                 submitted_at: s.time.0,
             },
             SchemaTxStatus::SuccessStatus(s) => TransactionStatus::Success {
-                block_height: s.block.height.into(),
+                #[cfg(feature = "test-helpers")]
+                transaction: s.transaction.try_into()?,
+                block_height: s.block_height.into(),
                 time: s.time.0,
                 program_state: s.program_state.map(TryInto::try_into).transpose()?,
                 receipts: s
@@ -129,9 +144,13 @@ impl TryFrom<SchemaTxStatus> for TransactionStatus {
                     .into_iter()
                     .map(TryInto::try_into)
                     .collect::<Result<Vec<_>, _>>()?,
+                total_gas: s.total_gas.0,
+                total_fee: s.total_fee.0,
             },
             SchemaTxStatus::FailureStatus(s) => TransactionStatus::Failure {
-                block_height: s.block.height.into(),
+                #[cfg(feature = "test-helpers")]
+                transaction: s.transaction.try_into()?,
+                block_height: s.block_height.into(),
                 time: s.time.0,
                 reason: s.reason,
                 program_state: s.program_state.map(TryInto::try_into).transpose()?,
@@ -140,6 +159,8 @@ impl TryFrom<SchemaTxStatus> for TransactionStatus {
                     .into_iter()
                     .map(TryInto::try_into)
                     .collect::<Result<Vec<_>, _>>()?,
+                total_gas: s.total_gas.0,
+                total_fee: s.total_fee.0,
             },
             SchemaTxStatus::SqueezedOutStatus(s) => {
                 TransactionStatus::SqueezedOut { reason: s.reason }
@@ -151,10 +172,10 @@ impl TryFrom<SchemaTxStatus> for TransactionStatus {
     }
 }
 
-impl TryFrom<OpaqueTransaction> for TransactionResponse {
+impl TryFrom<OpaqueTransactionWithStatus> for TransactionResponse {
     type Error = ConversionError;
 
-    fn try_from(value: OpaqueTransaction) -> Result<Self, Self::Error> {
+    fn try_from(value: OpaqueTransactionWithStatus) -> Result<Self, Self::Error> {
         let bytes = value.raw_payload.0 .0;
         let tx: Transaction = Transaction::from_bytes(bytes.as_slice())
             .map_err(ConversionError::TransactionFromBytesError)?;
@@ -166,6 +187,34 @@ impl TryFrom<OpaqueTransaction> for TransactionResponse {
         Ok(Self {
             transaction: tx,
             status,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayedTransactionStatus {
+    Failed {
+        block_height: BlockHeight,
+        failure: String,
+    },
+}
+
+impl TryFrom<SchemaRelayedTransactionStatus> for RelayedTransactionStatus {
+    type Error = ConversionError;
+
+    fn try_from(status: SchemaRelayedTransactionStatus) -> Result<Self, Self::Error> {
+        Ok(match status {
+            SchemaRelayedTransactionStatus::Failed(s) => {
+                RelayedTransactionStatus::Failed {
+                    block_height: s.block_height.into(),
+                    failure: s.failure,
+                }
+            }
+            SchemaRelayedTransactionStatus::Unknown => {
+                return Err(Self::Error::UnknownVariant(
+                    "SchemaRelayedTransactionStatus",
+                ));
+            }
         })
     }
 }

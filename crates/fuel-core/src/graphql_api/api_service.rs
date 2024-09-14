@@ -4,6 +4,7 @@ use crate::{
         ports::{
             BlockProducerPort,
             ConsensusModulePort,
+            ConsensusProvider as ConsensusProviderTrait,
             GasPriceEstimate,
             OffChainDatabase,
             OnChainDatabase,
@@ -17,7 +18,10 @@ use crate::{
         CoreSchema,
         CoreSchemaBuilder,
     },
-    service::metrics::metrics,
+    service::{
+        adapters::SharedMemoryPool,
+        metrics::metrics,
+    },
 };
 use async_graphql::{
     http::{
@@ -69,7 +73,6 @@ use std::{
         TcpListener,
     },
     pin::Pin,
-    time::Duration,
 };
 use tokio_stream::StreamExt;
 use tower_http::{
@@ -90,6 +93,8 @@ pub type ConsensusModule = Box<dyn ConsensusModulePort>;
 pub type P2pService = Box<dyn P2pPort>;
 
 pub type GasPriceProvider = Box<dyn GasPriceEstimate>;
+
+pub type ConsensusProvider = Box<dyn ConsensusProviderTrait>;
 
 #[derive(Clone)]
 pub struct SharedState {
@@ -165,9 +170,10 @@ impl RunnableTask for Task {
     }
 }
 
-// Need a seperate Data Object for each Query endpoint, cannot be avoided
+// Need a separate Data Object for each Query endpoint, cannot be avoided
 #[allow(clippy::too_many_arguments)]
 pub fn new_service<OnChain, OffChain>(
+    genesis_block_height: BlockHeight,
     config: Config,
     schema: CoreSchemaBuilder,
     on_database: OnChain,
@@ -177,19 +183,28 @@ pub fn new_service<OnChain, OffChain>(
     consensus_module: ConsensusModule,
     p2p_service: P2pService,
     gas_price_provider: GasPriceProvider,
-    log_threshold_ms: Duration,
-    request_timeout: Duration,
+    consensus_parameters_provider: ConsensusProvider,
+    memory_pool: SharedMemoryPool,
 ) -> anyhow::Result<Service>
 where
-    OnChain: AtomicView<Height = BlockHeight> + 'static,
-    OffChain: AtomicView<Height = BlockHeight> + 'static,
-    OnChain::View: OnChainDatabase,
-    OffChain::View: OffChainDatabase,
+    OnChain: AtomicView + 'static,
+    OffChain: AtomicView + 'static,
+    OnChain::LatestView: OnChainDatabase,
+    OffChain::LatestView: OffChainDatabase,
 {
-    let network_addr = config.addr;
-    let combined_read_database = ReadDatabase::new(on_database, off_database);
+    let network_addr = config.config.addr;
+    let combined_read_database =
+        ReadDatabase::new(genesis_block_height, on_database, off_database);
+    let request_timeout = config.config.api_request_timeout;
+    let body_limit = config.config.request_body_bytes_limit;
 
     let schema = schema
+        .limit_complexity(config.config.max_queries_complexity)
+        .limit_depth(config.config.max_queries_depth)
+        .limit_recursive_depth(config.config.max_queries_recursive_depth)
+        .extension(MetricsExtension::new(
+            config.config.query_log_threshold_time,
+        ))
         .data(config)
         .data(combined_read_database)
         .data(txpool)
@@ -197,8 +212,9 @@ where
         .data(consensus_module)
         .data(p2p_service)
         .data(gas_price_provider)
+        .data(consensus_parameters_provider)
+        .data(memory_pool)
         .extension(async_graphql::extensions::Tracing)
-        .extension(MetricsExtension::new(log_threshold_ms))
         .extension(ViewExtension::new())
         .finish();
 
@@ -211,6 +227,7 @@ where
         )
         .route("/v1/metrics", get(metrics))
         .route("/v1/health", get(health))
+        .route("/health", get(health))
         .layer(Extension(schema))
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::new(request_timeout))
@@ -226,7 +243,7 @@ where
             ACCESS_CONTROL_ALLOW_HEADERS,
             HeaderValue::from_static("*"),
         ))
-        .layer(DefaultBodyLimit::disable());
+        .layer(DefaultBodyLimit::max(body_limit));
 
     let listener = TcpListener::bind(network_addr)?;
     let bound_address = listener.local_addr()?;
@@ -262,7 +279,7 @@ async fn graphql_subscription_handler(
 ) -> Sse<impl Stream<Item = anyhow::Result<Event, serde_json::Error>>> {
     let stream = schema
         .execute_stream(req.0)
-        .map(|r| Ok(Event::default().json_data(r).unwrap()));
+        .map(|r| Event::default().json_data(r));
     Sse::new(stream)
         .keep_alive(axum::response::sse::KeepAlive::new().text("keep-alive-text"))
 }

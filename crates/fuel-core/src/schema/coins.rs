@@ -4,21 +4,25 @@ use crate::{
         SpendQuery,
     },
     fuel_core_graphql_api::{
-        database::ReadView,
-        Config as GraphQLConfig,
         IntoApiResult,
+        QUERY_COSTS,
     },
+    graphql_api::api_service::ConsensusProvider,
     query::{
         asset_query::AssetSpendTarget,
         CoinQueryData,
     },
-    schema::scalars::{
-        Address,
-        AssetId,
-        Nonce,
-        UtxoId,
-        U32,
-        U64,
+    schema::{
+        scalars::{
+            Address,
+            AssetId,
+            Nonce,
+            UtxoId,
+            U16,
+            U32,
+            U64,
+        },
+        ReadViewProvider,
     },
 };
 use async_graphql::{
@@ -66,8 +70,8 @@ impl Coin {
     }
 
     /// TxPointer - the index of the transaction that created this coin
-    async fn tx_created_idx(&self) -> U64 {
-        u64::from(self.0.tx_pointer.tx_index()).into()
+    async fn tx_created_idx(&self) -> U16 {
+        self.0.tx_pointer.tx_index().into()
     }
 }
 
@@ -91,9 +95,13 @@ impl MessageCoin {
         self.0.amount.into()
     }
 
+    #[graphql(complexity = "QUERY_COSTS.storage_read")]
     async fn asset_id(&self, ctx: &Context<'_>) -> AssetId {
-        let config = ctx.data_unchecked::<GraphQLConfig>();
-        let base_asset_id = *config.consensus_parameters.base_asset_id();
+        let params = ctx
+            .data_unchecked::<ConsensusProvider>()
+            .latest_consensus_params();
+
+        let base_asset_id = *params.base_asset_id();
         base_asset_id.into()
     }
 
@@ -143,16 +151,22 @@ pub struct CoinQuery;
 #[async_graphql::Object]
 impl CoinQuery {
     /// Gets the coin by `utxo_id`.
+    #[graphql(complexity = "QUERY_COSTS.storage_read + child_complexity")]
     async fn coin(
         &self,
         ctx: &Context<'_>,
         #[graphql(desc = "The ID of the coin")] utxo_id: UtxoId,
     ) -> async_graphql::Result<Option<Coin>> {
-        let query: &ReadView = ctx.data_unchecked();
+        let query = ctx.read_view()?;
         query.coin(utxo_id.0).into_api_result()
     }
 
     /// Gets all unspent coins of some `owner` maybe filtered with by `asset_id` per page.
+    #[graphql(complexity = "{\
+        QUERY_COSTS.storage_iterator\
+        + (QUERY_COSTS.storage_read + first.unwrap_or_default() as usize) * child_complexity \
+        + (QUERY_COSTS.storage_read + last.unwrap_or_default() as usize) * child_complexity\
+    }")]
     async fn coins(
         &self,
         ctx: &Context<'_>,
@@ -162,7 +176,7 @@ impl CoinQuery {
         last: Option<i32>,
         before: Option<String>,
     ) -> async_graphql::Result<Connection<UtxoId, Coin, EmptyFields, EmptyFields>> {
-        let query: &ReadView = ctx.data_unchecked();
+        let query = ctx.read_view()?;
         crate::schema::query_pagination(after, before, first, last, |start, direction| {
             let owner: fuel_tx::Address = filter.owner.into();
             let coins = query
@@ -194,6 +208,7 @@ impl CoinQuery {
     ///     The list of spendable coins per asset from the query. The length of the result is
     ///     the same as the length of `query_per_asset`. The ordering of assets and `query_per_asset`
     ///     is the same.
+    #[graphql(complexity = "QUERY_COSTS.coins_to_spend")]
     async fn coins_to_spend(
         &self,
         ctx: &Context<'_>,
@@ -207,7 +222,9 @@ impl CoinQuery {
             ExcludeInput,
         >,
     ) -> async_graphql::Result<Vec<Vec<CoinType>>> {
-        let config = ctx.data_unchecked::<GraphQLConfig>();
+        let params = ctx
+            .data_unchecked::<ConsensusProvider>()
+            .latest_consensus_params();
 
         let owner: fuel_tx::Address = owner.0;
         let query_per_asset = query_per_asset
@@ -232,13 +249,13 @@ impl CoinQuery {
             utxos.chain(messages).collect()
         });
 
-        let base_asset_id = config.consensus_parameters.base_asset_id();
+        let base_asset_id = params.base_asset_id();
         let spend_query =
             SpendQuery::new(owner, &query_per_asset, excluded_ids, *base_asset_id)?;
 
-        let query: &ReadView = ctx.data_unchecked();
+        let query = ctx.read_view()?;
 
-        let coins = random_improve(query, &spend_query)?
+        let coins = random_improve(query.as_ref(), &spend_query)?
             .into_iter()
             .map(|coins| {
                 coins

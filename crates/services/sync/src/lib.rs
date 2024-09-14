@@ -3,6 +3,8 @@
 #![deny(unused_crate_dependencies)]
 #![deny(missing_docs)]
 #![deny(warnings)]
+#![allow(clippy::blocks_in_conditions)] // Triggered by tracing macros
+
 //! # Sync Service
 //! Responsible for syncing the blockchain from the network.
 
@@ -11,7 +13,6 @@ pub mod ports;
 pub mod service;
 pub mod state;
 pub mod sync;
-mod tracing_helpers;
 
 pub use import::Config;
 

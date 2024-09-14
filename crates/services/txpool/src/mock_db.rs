@@ -9,17 +9,16 @@ use fuel_core_types::{
             Coin,
             CompressedCoin,
         },
-        message::Message,
+        relayer::message::Message,
     },
     fuel_tx::{
+        BlobId,
         Contract,
         ContractId,
         UtxoId,
     },
-    fuel_types::{
-        BlockHeight,
-        Nonce,
-    },
+    fuel_types::Nonce,
+    fuel_vm::BlobBytes,
 };
 use std::{
     collections::{
@@ -36,6 +35,7 @@ use std::{
 pub struct Data {
     pub coins: HashMap<UtxoId, CompressedCoin>,
     pub contracts: HashMap<ContractId, Contract>,
+    pub blobs: HashMap<BlobId, BlobBytes>,
     pub messages: HashMap<Nonce, Message>,
     pub spent_messages: HashSet<Nonce>,
 }
@@ -54,6 +54,14 @@ impl MockDb {
             .insert(coin.utxo_id, coin.compress());
     }
 
+    pub fn insert_dummy_blob(&self, blob_id: BlobId) {
+        self.data
+            .lock()
+            .unwrap()
+            .blobs
+            .insert(blob_id, vec![123; 123].into());
+    }
+
     pub fn insert_message(&self, message: Message) {
         self.data
             .lock()
@@ -69,13 +77,7 @@ impl MockDb {
 
 impl TxPoolDb for MockDb {
     fn utxo(&self, utxo_id: &UtxoId) -> StorageResult<Option<CompressedCoin>> {
-        Ok(self
-            .data
-            .lock()
-            .unwrap()
-            .coins
-            .get(utxo_id)
-            .map(Clone::clone))
+        Ok(self.data.lock().unwrap().coins.get(utxo_id).cloned())
     }
 
     fn contract_exist(&self, contract_id: &ContractId) -> StorageResult<bool> {
@@ -87,31 +89,21 @@ impl TxPoolDb for MockDb {
             .contains_key(contract_id))
     }
 
-    fn message(&self, id: &Nonce) -> StorageResult<Option<Message>> {
-        Ok(self.data.lock().unwrap().messages.get(id).map(Clone::clone))
+    fn blob_exist(&self, blob_id: &BlobId) -> StorageResult<bool> {
+        Ok(self.data.lock().unwrap().blobs.contains_key(blob_id))
     }
 
-    fn is_message_spent(&self, id: &Nonce) -> StorageResult<bool> {
-        Ok(self.data.lock().unwrap().spent_messages.contains(id))
+    fn message(&self, id: &Nonce) -> StorageResult<Option<Message>> {
+        Ok(self.data.lock().unwrap().messages.get(id).cloned())
     }
 }
 
 pub struct MockDBProvider(pub MockDb);
 
 impl AtomicView for MockDBProvider {
-    type View = MockDb;
+    type LatestView = MockDb;
 
-    type Height = BlockHeight;
-
-    fn latest_height(&self) -> Option<Self::Height> {
-        Some(BlockHeight::default())
-    }
-
-    fn view_at(&self, _: &BlockHeight) -> StorageResult<Self::View> {
-        Ok(self.latest_view())
-    }
-
-    fn latest_view(&self) -> Self::View {
-        self.0.clone()
+    fn latest_view(&self) -> StorageResult<Self::LatestView> {
+        Ok(self.0.clone())
     }
 }

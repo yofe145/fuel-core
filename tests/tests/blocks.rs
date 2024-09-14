@@ -1,7 +1,7 @@
 use fuel_core::{
     chain_config::{
+        LastBlockConfig,
         StateConfig,
-        StateReader,
     },
     database::Database,
     service::{
@@ -17,7 +17,10 @@ use fuel_core_client::client::{
     types::TransactionStatus,
     FuelClient,
 };
-use fuel_core_poa::Trigger;
+use fuel_core_poa::{
+    signer::SignMode,
+    Trigger,
+};
 use fuel_core_storage::{
     tables::{
         FuelBlocks,
@@ -45,6 +48,7 @@ use std::{
     ops::Deref,
     time::Duration,
 };
+use test_helpers::send_graph_ql_query;
 
 #[tokio::test]
 async fn block() {
@@ -76,25 +80,33 @@ async fn block() {
 }
 
 #[tokio::test]
-async fn get_genesis_block() {
-    let config = Config {
-        state_reader: StateReader::in_memory(StateConfig {
-            block_height: 13u32.into(),
-            ..StateConfig::local_testnet()
+async fn block_by_height_returns_genesis_block() {
+    // Given
+    let block_height_of_last_block_before_regenesis = 13u32.into();
+    let config = Config::local_node_with_state_config(StateConfig {
+        last_block: Some(LastBlockConfig {
+            block_height: block_height_of_last_block_before_regenesis,
+            state_transition_version: 0,
+            ..Default::default()
         }),
-        ..Config::local_node()
-    };
+        ..StateConfig::local_testnet()
+    });
 
+    // When
     let srv = FuelService::from_database(Database::default(), config)
         .await
         .unwrap();
 
+    // Then
     let client = FuelClient::from(srv.bound_address);
-    let tx = Transaction::default_test_tx();
-    client.submit_and_await_commit(&tx).await.unwrap();
-
-    let block = client.block_by_height(13.into()).await.unwrap().unwrap();
-    assert_eq!(block.header.height, 13);
+    let block_height_of_new_genesis_block =
+        block_height_of_last_block_before_regenesis.succ().unwrap();
+    let block = client
+        .block_by_height(block_height_of_new_genesis_block)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(block.header.height, 14);
     assert!(matches!(
         block.consensus,
         fuel_core_client::client::types::Consensus::Genesis(_)
@@ -118,15 +130,15 @@ async fn produce_block() {
         let block = client.block_by_height(block_height).await.unwrap().unwrap();
         let actual_pub_key = block.block_producer().unwrap();
         let block_height: u32 = block.header.height;
-        let expected_pub_key = config
-            .consensus_key
-            .unwrap()
-            .expose_secret()
-            .deref()
-            .public_key();
+        assert_eq!(block_height, 1);
 
-        assert!(1 == block_height);
-        assert_eq!(*actual_pub_key, expected_pub_key);
+        match config.consensus_signer {
+            SignMode::Key(key) => {
+                let expected_pub_key = key.expose_secret().deref().public_key();
+                assert_eq!(*actual_pub_key, expected_pub_key);
+            }
+            _ => panic!("config must have a consensus signing key"),
+        }
     } else {
         panic!("Wrong tx status");
     };
@@ -150,13 +162,13 @@ async fn produce_block_manually() {
     let block = client.block_by_height(1.into()).await.unwrap().unwrap();
     assert_eq!(block.header.height, 1);
     let actual_pub_key = block.block_producer().unwrap();
-    let expected_pub_key = config
-        .consensus_key
-        .unwrap()
-        .expose_secret()
-        .deref()
-        .public_key();
-    assert_eq!(*actual_pub_key, expected_pub_key);
+    match config.consensus_signer {
+        SignMode::Key(key) => {
+            let expected_pub_key = key.expose_secret().deref().public_key();
+            assert_eq!(*actual_pub_key, expected_pub_key);
+        }
+        _ => panic!("config must have a consensus signing key"),
+    }
 }
 
 #[tokio::test]
@@ -314,6 +326,23 @@ async fn block_connection_5(
     };
 }
 
+#[tokio::test]
+async fn missing_first_and_last_parameters_returns_an_error() {
+    let query = r#"
+        query {
+          transactions(before: "00000000#0x00"){
+            __typename
+          }
+        }
+    "#;
+
+    let node = FuelService::new_node(Config::local_node()).await.unwrap();
+    let url = format!("http://{}/v1/graphql", node.bound_address);
+
+    let result = send_graph_ql_query(&url, query).await;
+    assert!(result.contains("The queries for the whole range is not supported"));
+}
+
 mod full_block {
     use super::*;
     use cynic::QueryBuilder;
@@ -348,6 +377,7 @@ mod full_block {
         schema_path = "../crates/client/assets/schema.sdl",
         graphql_type = "Block"
     )]
+    #[allow(dead_code)]
     pub struct FullBlock {
         pub id: BlockId,
         pub header: Header,

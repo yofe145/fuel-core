@@ -18,9 +18,13 @@ use fuel_core_poa::service::Mode;
 use fuel_core_types::{
     fuel_asm::*,
     fuel_crypto::SecretKey,
-    fuel_tx::*,
+    fuel_tx::{
+        field::ReceiptsRoot,
+        *,
+    },
     fuel_types::ChainId,
 };
+use futures::StreamExt;
 use itertools::Itertools;
 use rand::{
     prelude::StdRng,
@@ -33,6 +37,7 @@ mod predicates;
 mod tx_pointer;
 mod txn_status_subscription;
 mod txpool;
+mod upgrade;
 mod utxo_validation;
 
 #[test]
@@ -80,7 +85,7 @@ async fn dry_run_script() {
     let tx_statuses = client.dry_run(&[tx.clone()]).await.unwrap();
     let log = tx_statuses
         .last()
-        .expect("Nonempty repsonse")
+        .expect("Nonempty response")
         .result
         .receipts();
     assert_eq!(3, log.len());
@@ -141,6 +146,42 @@ async fn dry_run_create() {
 }
 
 #[tokio::test]
+async fn dry_run_above_block_gas_limit() {
+    let config = Config::local_node();
+    let srv = FuelService::new_node(config).await.unwrap();
+    let client = FuelClient::from(srv.bound_address);
+
+    // Given
+    let gas_limit = client
+        .consensus_parameters(0)
+        .await
+        .unwrap()
+        .unwrap()
+        .block_gas_limit();
+    let maturity = Default::default();
+
+    let script = [
+        op::addi(0x10, RegId::ZERO, 0xca),
+        op::addi(0x11, RegId::ZERO, 0xba),
+        op::log(0x10, 0x11, RegId::ZERO, RegId::ZERO),
+        op::ret(RegId::ONE),
+    ];
+    let script = script.into_iter().collect();
+
+    let tx = TransactionBuilder::script(script, vec![])
+        .script_gas_limit(gas_limit)
+        .maturity(maturity)
+        .add_random_fee_input()
+        .finalize_as_transaction();
+
+    // When
+    match client.dry_run(&[tx.clone()]).await {
+        Ok(_) => panic!("Expected error"),
+        Err(e) => assert_eq!(e.to_string(), "Response errors; The sum of the gas usable by the transactions is greater than the block gas limit".to_owned()),
+    }
+}
+
+#[tokio::test]
 async fn submit() {
     let srv = FuelService::new_node(Config::local_node()).await.unwrap();
     let client = FuelClient::from(srv.bound_address);
@@ -174,6 +215,41 @@ async fn submit() {
         .unwrap()
         .transaction;
     assert_eq!(tx.id(&ChainId::default()), ret_tx.id(&ChainId::default()));
+}
+
+#[tokio::test]
+async fn submit_and_await_status() {
+    let srv = FuelService::new_node(Config::local_node()).await.unwrap();
+    let client = FuelClient::from(srv.bound_address);
+
+    let gas_limit = 1_000_000;
+    let maturity = Default::default();
+
+    let script = [
+        op::addi(0x10, RegId::ZERO, 0xca),
+        op::addi(0x11, RegId::ZERO, 0xba),
+        op::log(0x10, 0x11, RegId::ZERO, RegId::ZERO),
+        op::ret(RegId::ONE),
+    ];
+    let script: Vec<u8> = script
+        .iter()
+        .flat_map(|op| u32::from(*op).to_be_bytes())
+        .collect();
+
+    let tx = TransactionBuilder::script(script, vec![])
+        .script_gas_limit(gas_limit)
+        .maturity(maturity)
+        .add_random_fee_input()
+        .finalize_as_transaction();
+
+    let mut status_stream = client.submit_and_await_status(&tx).await.unwrap();
+    let intermediate_status = status_stream.next().await.unwrap().unwrap();
+    assert!(matches!(
+        intermediate_status,
+        TransactionStatus::Submitted { .. }
+    ));
+    let final_status = status_stream.next().await.unwrap().unwrap();
+    assert!(matches!(final_status, TransactionStatus::Success { .. }));
 }
 
 #[ignore]
@@ -268,12 +344,47 @@ async fn get_transparent_transaction_by_id() {
 }
 
 #[tokio::test]
+async fn get_executed_transaction_from_status() {
+    let srv = FuelService::new_node(Config::local_node()).await.unwrap();
+    let client = FuelClient::from(srv.bound_address);
+
+    // Given
+    let transaction = Transaction::default_test_tx();
+    let receipt_root_before_execution = *transaction.as_script().unwrap().receipts_root();
+    assert_eq!(receipt_root_before_execution, Bytes32::zeroed());
+
+    // When
+    let result = client.submit_and_await_commit(&transaction).await;
+
+    // Then
+    let status = result.expect("Expected executed transaction");
+    let TransactionStatus::Success { transaction, .. } = status else {
+        panic!("Not successful transaction")
+    };
+    let receipt_root_after_execution = *transaction.as_script().unwrap().receipts_root();
+    assert_ne!(receipt_root_after_execution, Bytes32::zeroed());
+}
+
+#[tokio::test]
 async fn get_transactions() {
     let alice = Address::from([1; 32]);
     let bob = Address::from([2; 32]);
     let charlie = Address::from([3; 32]);
 
     let mut context = TestContext::new(100).await;
+    // Produce 10 blocks to ensure https://github.com/FuelLabs/fuel-core/issues/1825 is tested
+    context
+        .srv
+        .shared
+        .poa_adapter
+        .manually_produce_blocks(
+            None,
+            Mode::Blocks {
+                number_of_blocks: 10,
+            },
+        )
+        .await
+        .expect("Should produce block");
     let tx1 = context.transfer(alice, charlie, 1).await.unwrap();
     let tx2 = context.transfer(charlie, bob, 2).await.unwrap();
     let tx3 = context.transfer(bob, charlie, 3).await.unwrap();
@@ -281,21 +392,35 @@ async fn get_transactions() {
     let tx5 = context.transfer(charlie, alice, 1).await.unwrap();
     let tx6 = context.transfer(alice, charlie, 1).await.unwrap();
 
-    // there are 12 transactions
+    // Skip the 10 first txs included in the tx pool by the creation of the 10 blocks above
+    let page_request = PaginationRequest {
+        cursor: None,
+        results: 10,
+        direction: PageDirection::Forward,
+    };
+    let client = context.client;
+    let response = client.transactions(page_request.clone()).await.unwrap();
+    assert_eq!(response.results.len(), 10);
+    assert!(!response.has_previous_page);
+    assert!(response.has_next_page);
+
+    // Now, there are 12 transactions
     // [
     //  tx1, coinbase_tx1, tx2, coinbase_tx2, tx3, coinbase_tx3,
     //  tx4, coinbase_tx4, tx5, coinbase_tx5, tx6, coinbase_tx6,
     // ]
 
     // Query for first 6: [tx1, coinbase_tx1, tx2, coinbase_tx2, tx3, coinbase_tx3]
-    let client = context.client;
-    let page_request = PaginationRequest {
-        cursor: None,
+    let first_middle_page_request = PaginationRequest {
+        cursor: response.cursor.clone(),
         results: 6,
         direction: PageDirection::Forward,
     };
 
-    let response = client.transactions(page_request.clone()).await.unwrap();
+    let response = client
+        .transactions(first_middle_page_request.clone())
+        .await
+        .unwrap();
     let transactions = &response
         .results
         .iter()
@@ -307,9 +432,9 @@ async fn get_transactions() {
     // coinbase_tx2
     assert_eq!(transactions[4], tx3);
     // coinbase_tx3
-    // Check pagination state for first page
+    // Check pagination state for middle page
     assert!(response.has_next_page);
-    assert!(!response.has_previous_page);
+    assert!(response.has_previous_page);
 
     // Query for second page 2 with last given cursor: [tx4, coinbase_tx4, tx5, coinbase_tx5]
     let page_request_middle_page = PaginationRequest {
@@ -318,10 +443,10 @@ async fn get_transactions() {
         direction: PageDirection::Forward,
     };
 
-    // Query backwards from last given cursor [3]: [tx3, coinbase_tx2, tx2, coinbase_tx1, tx1]
+    // Query backwards from last given cursor [3]: [tx3, coinbase_tx2, tx2, coinbase_tx1, tx1, tx_block_creation_10, tx_block_creation_9, ...]
     let page_request_backwards = PaginationRequest {
         cursor: response.cursor.clone(),
-        results: 6,
+        results: 16,
         direction: PageDirection::Backward,
     };
 

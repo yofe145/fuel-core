@@ -1,28 +1,21 @@
 use fuel_core::{
     chain_config::{
-        CoinConfig,
-        CoinConfigGenerator,
-        ContractBalanceConfig,
-        ContractConfig,
-        ContractStateConfig,
-        MessageConfig,
+        LastBlockConfig,
+        Randomize,
         StateConfig,
-        StateReader,
     },
-    database::Database,
+    combined_database::CombinedDatabase,
     service::{
         Config,
         FuelService,
     },
 };
-use fuel_core_types::{
-    blockchain::primitives::DaBlockHeight,
-    fuel_types::{
-        BlockHeight,
-        Nonce,
-        *,
-    },
+use fuel_core_poa::{
+    ports::Database,
+    Trigger,
 };
+use fuel_core_storage::transactional::AtomicView;
+use fuel_core_types::blockchain::primitives::DaBlockHeight;
 use rand::{
     rngs::StdRng,
     Rng,
@@ -32,100 +25,45 @@ use rand::{
 #[tokio::test]
 async fn loads_snapshot() {
     let mut rng = StdRng::seed_from_u64(1234);
-    let db = Database::default();
-
-    let owner = Address::default();
+    let db = CombinedDatabase::default();
+    let blocks_root = rng.gen();
 
     // setup config
-    let mut coin_generator = CoinConfigGenerator::new();
-    let contract_id = ContractId::new([11; 32]);
     let starting_state = StateConfig {
-        contracts: vec![ContractConfig {
-            contract_id,
-            code: vec![8; 32],
-            tx_id: rng.gen(),
-            output_index: rng.gen(),
-            tx_pointer_block_height: BlockHeight::from(10),
-            tx_pointer_tx_idx: rng.gen(),
-        }],
-        contract_balance: vec![
-            ContractBalanceConfig {
-                contract_id,
-                amount: 100,
-                asset_id: AssetId::new([3u8; 32]),
-            },
-            ContractBalanceConfig {
-                contract_id,
-                amount: 10000,
-                asset_id: AssetId::new([10u8; 32]),
-            },
-        ],
-        contract_state: vec![
-            ContractStateConfig {
-                contract_id,
-                key: Bytes32::new([5u8; 32]),
-                value: [8u8; 32].to_vec(),
-            },
-            ContractStateConfig {
-                contract_id,
-                key: Bytes32::new([7u8; 32]),
-                value: [9u8; 32].to_vec(),
-            },
-        ],
-        coins: vec![
-            (owner, 50, AssetId::new([8u8; 32])),
-            (owner, 100, AssetId::new([3u8; 32])),
-            (owner, 150, AssetId::new([5u8; 32])),
-        ]
-        .into_iter()
-        .map(|(owner, amount, asset_id)| CoinConfig {
-            owner,
-            amount,
-            asset_id,
-            ..coin_generator.generate()
-        })
-        .collect(),
-        messages: vec![MessageConfig {
-            sender: rng.gen(),
-            recipient: rng.gen(),
-            nonce: Nonce::from(rng.gen_range(0..1000)),
-            amount: rng.gen_range(0..1000),
-            data: vec![],
-            da_height: DaBlockHeight(19),
-        }],
-        block_height: BlockHeight::from(10),
-        da_block_height: 20u64.into(),
+        last_block: Some(LastBlockConfig {
+            block_height: (u32::MAX - 1).into(),
+            da_block_height: DaBlockHeight(u64::MAX),
+            consensus_parameters_version: u32::MAX - 1,
+            state_transition_version: u32::MAX - 1,
+            blocks_root,
+        }),
+        ..StateConfig::randomize(&mut rng)
     };
-    let config = Config {
-        state_reader: StateReader::in_memory(starting_state.clone()),
-        ..Config::local_node()
-    };
+    // Disable block production
+    let mut config = Config::local_node_with_state_config(starting_state.clone());
+    config.debug = false;
+    config.block_production = Trigger::Never;
 
     // setup server & client
-    let _ = FuelService::from_database(db.clone(), config)
+    let _ = FuelService::from_combined_database(db.clone(), config)
         .await
         .unwrap();
 
-    let state_conf = StateConfig::from_db(db).unwrap();
+    let actual_state = db.read_state_config().unwrap();
+    let mut expected = starting_state.sorted();
+    expected.last_block = Some(LastBlockConfig {
+        block_height: u32::MAX.into(),
+        da_block_height: DaBlockHeight(u64::MAX),
+        consensus_parameters_version: u32::MAX,
+        state_transition_version: u32::MAX,
+        blocks_root: db
+            .on_chain()
+            .latest_view()
+            .unwrap()
+            .block_header_merkle_root(&u32::MAX.into())
+            .unwrap(),
+    });
 
     // initial state
-
-    let starting_coin = starting_state.clone().coins;
-    let state_coin = state_conf.clone().coins;
-
-    for i in 0..starting_coin.len() {
-        // all values are checked except tx_id and output_index as those are generated and not
-        // known at initialization
-        assert_eq!(state_coin[i].owner, starting_coin[i].owner);
-        assert_eq!(state_coin[i].asset_id, starting_coin[i].asset_id);
-        assert_eq!(state_coin[i].amount, starting_coin[i].amount);
-        assert_eq!(
-            state_coin[i].tx_pointer_block_height,
-            starting_coin[i].tx_pointer_block_height
-        );
-    }
-
-    assert_eq!(state_conf.contracts, starting_state.contracts);
-
-    assert_eq!(state_conf.messages, starting_state.messages)
+    pretty_assertions::assert_eq!(expected, actual_state);
 }

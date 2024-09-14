@@ -1,26 +1,40 @@
-use bech32::{
-    ToBase32,
-    Variant::Bech32m,
+use super::{
+    blob::BlobConfig,
+    coin::CoinConfig,
+    contract::ContractConfig,
+    message::MessageConfig,
+    table_entry::TableEntry,
 };
-use core::{
-    fmt::Debug,
-    str::FromStr,
+use crate::{
+    ContractBalanceConfig,
+    ContractStateConfig,
 };
 use fuel_core_storage::{
-    iter::BoxedIter,
-    Result as StorageResult,
+    structured_storage::TableWithBlueprint,
+    tables::{
+        Coins,
+        ContractsAssets,
+        ContractsLatestUtxo,
+        ContractsRawCode,
+        ContractsState,
+        FuelBlocks,
+        Messages,
+        ProcessedTransactions,
+        SealedBlockConsensus,
+        Transactions,
+    },
+    ContractsAssetKey,
+    ContractsStateKey,
+    Mappable,
 };
 use fuel_core_types::{
-    blockchain::{
-        block::CompressedBlock,
-        primitives::DaBlockHeight,
-    },
+    blockchain::primitives::DaBlockHeight,
+    entities::contract::ContractUtxoInfo,
     fuel_types::{
-        Address,
         BlockHeight,
         Bytes32,
     },
-    fuel_vm::SecretKey,
+    fuel_vm::BlobData,
 };
 use itertools::Itertools;
 use serde::{
@@ -28,16 +42,31 @@ use serde::{
     Serialize,
 };
 
-use crate::CoinConfigGenerator;
 #[cfg(feature = "std")]
 use crate::SnapshotMetadata;
 
-use super::{
-    coin::CoinConfig,
-    contract::ContractConfig,
-    contract_balance::ContractBalanceConfig,
-    contract_state::ContractStateConfig,
-    message::MessageConfig,
+#[cfg(feature = "test-helpers")]
+use crate::CoinConfigGenerator;
+#[cfg(feature = "test-helpers")]
+use bech32::{
+    ToBase32,
+    Variant::Bech32m,
+};
+#[cfg(feature = "test-helpers")]
+use core::str::FromStr;
+use fuel_core_storage::tables::merkle::{
+    FuelBlockMerkleData,
+    FuelBlockMerkleMetadata,
+};
+use fuel_core_types::blockchain::header::{
+    BlockHeader,
+    ConsensusParametersVersion,
+    StateTransitionBytecodeVersion,
+};
+#[cfg(feature = "test-helpers")]
+use fuel_core_types::{
+    fuel_types::Address,
+    fuel_vm::SecretKey,
 };
 
 #[cfg(feature = "parquet")]
@@ -58,7 +87,35 @@ pub const TESTNET_WALLET_SECRETS: [&str; 5] = [
     "0x7f8a325504e7315eda997db7861c9447f5c3eff26333b20180475d94443a10c6",
 ];
 
-pub const STATE_CONFIG_FILENAME: &str = "state_config.json";
+#[derive(Default, Copy, Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct LastBlockConfig {
+    /// The block height of the last block.
+    pub block_height: BlockHeight,
+    /// The da height used in the last block.
+    pub da_block_height: DaBlockHeight,
+    /// The version of consensus parameters used to produce last block.
+    pub consensus_parameters_version: ConsensusParametersVersion,
+    /// The version of state transition function used to produce last block.
+    pub state_transition_version: StateTransitionBytecodeVersion,
+    /// The Merkle root of all blocks before regenesis.
+    pub blocks_root: Bytes32,
+}
+
+impl LastBlockConfig {
+    pub fn from_header(header: &BlockHeader, blocks_root: Bytes32) -> Self {
+        Self {
+            block_height: *header.height(),
+            da_block_height: header.application().da_height,
+            consensus_parameters_version: header
+                .application()
+                .consensus_parameters_version,
+            state_transition_version: header
+                .application()
+                .state_transition_bytecode_version,
+            blocks_root,
+        }
+    }
+}
 
 #[derive(Default, Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct StateConfig {
@@ -66,118 +123,484 @@ pub struct StateConfig {
     pub coins: Vec<CoinConfig>,
     /// Messages from Layer 1
     pub messages: Vec<MessageConfig>,
+    /// Blobs
+    #[serde(default)]
+    pub blobs: Vec<BlobConfig>,
     /// Contracts
     pub contracts: Vec<ContractConfig>,
-    /// State entries of all contracts
-    pub contract_state: Vec<ContractStateConfig>,
-    /// Balance entries of all contracts
-    pub contract_balance: Vec<ContractBalanceConfig>,
-    /// Block height
-    pub block_height: BlockHeight,
-    /// Da block height
-    pub da_block_height: DaBlockHeight,
+    /// Last block config.
+    pub last_block: Option<LastBlockConfig>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct StateConfigBuilder {
+    coins: Vec<TableEntry<Coins>>,
+    messages: Vec<TableEntry<Messages>>,
+    blobs: Vec<TableEntry<BlobData>>,
+    contract_state: Vec<TableEntry<ContractsState>>,
+    contract_balance: Vec<TableEntry<ContractsAssets>>,
+    contract_code: Vec<TableEntry<ContractsRawCode>>,
+    contract_utxo: Vec<TableEntry<ContractsLatestUtxo>>,
+}
+
+impl StateConfigBuilder {
+    pub fn merge(&mut self, builder: Self) -> &mut Self {
+        self.coins.extend(builder.coins);
+        self.messages.extend(builder.messages);
+        self.blobs.extend(builder.blobs);
+        self.contract_state.extend(builder.contract_state);
+        self.contract_balance.extend(builder.contract_balance);
+        self.contract_code.extend(builder.contract_code);
+        self.contract_utxo.extend(builder.contract_utxo);
+
+        self
+    }
+
+    #[cfg(feature = "std")]
+    pub fn build(
+        self,
+        latest_block_config: Option<LastBlockConfig>,
+    ) -> anyhow::Result<StateConfig> {
+        use std::collections::HashMap;
+
+        let coins = self.coins.into_iter().map(|coin| coin.into()).collect();
+        let messages = self
+            .messages
+            .into_iter()
+            .map(|message| message.into())
+            .collect();
+        let blobs = self.blobs.into_iter().map(|blob| blob.into()).collect();
+        let contract_ids = self
+            .contract_code
+            .iter()
+            .map(|entry| entry.key)
+            .collect::<Vec<_>>();
+        let mut state: HashMap<_, _> = self
+            .contract_state
+            .into_iter()
+            .map(|state| {
+                (
+                    *state.key.contract_id(),
+                    ContractStateConfig {
+                        key: *state.key.state_key(),
+                        value: state.value.into(),
+                    },
+                )
+            })
+            .into_group_map();
+
+        let mut balance: HashMap<_, _> = self
+            .contract_balance
+            .into_iter()
+            .map(|balance| {
+                (
+                    *balance.key.contract_id(),
+                    ContractBalanceConfig {
+                        asset_id: *balance.key.asset_id(),
+                        amount: balance.value,
+                    },
+                )
+            })
+            .into_group_map();
+
+        let mut contract_code: HashMap<_, Vec<u8>> = self
+            .contract_code
+            .into_iter()
+            .map(|entry| (entry.key, entry.value.into()))
+            .collect();
+
+        let mut contract_utxos: HashMap<_, _> = self
+            .contract_utxo
+            .into_iter()
+            .map(|entry| match entry.value {
+                ContractUtxoInfo::V1(utxo) => {
+                    (entry.key, (utxo.utxo_id, utxo.tx_pointer))
+                }
+                _ => unreachable!(),
+            })
+            .collect();
+
+        let contracts = contract_ids
+            .into_iter()
+            .map(|id| -> anyhow::Result<_> {
+                let code = contract_code
+                    .remove(&id)
+                    .ok_or_else(|| anyhow::anyhow!("Missing code for contract: {id}"))?;
+                let (utxo_id, tx_pointer) = contract_utxos
+                    .remove(&id)
+                    .ok_or_else(|| anyhow::anyhow!("Missing utxo for contract: {id}"))?;
+                let states = state.remove(&id).unwrap_or_default();
+                let balances = balance.remove(&id).unwrap_or_default();
+
+                Ok(ContractConfig {
+                    contract_id: id,
+                    code,
+                    tx_id: *utxo_id.tx_id(),
+                    output_index: utxo_id.output_index(),
+                    tx_pointer_block_height: tx_pointer.block_height(),
+                    tx_pointer_tx_idx: tx_pointer.tx_index(),
+                    states,
+                    balances,
+                })
+            })
+            .try_collect()?;
+
+        Ok(StateConfig {
+            coins,
+            messages,
+            blobs,
+            contracts,
+            last_block: latest_block_config,
+        })
+    }
+}
+
+pub trait AddTable<T>
+where
+    T: Mappable,
+{
+    fn add(&mut self, _entries: Vec<TableEntry<T>>);
+}
+
+impl AddTable<Coins> for StateConfigBuilder {
+    fn add(&mut self, entries: Vec<TableEntry<Coins>>) {
+        self.coins.extend(entries);
+    }
+}
+
+impl AsTable<Coins> for StateConfig {
+    fn as_table(&self) -> Vec<TableEntry<Coins>> {
+        self.coins
+            .clone()
+            .into_iter()
+            .map(|coin| coin.into())
+            .collect()
+    }
+}
+
+#[cfg(feature = "test-helpers")]
+impl crate::Randomize for StateConfig {
+    fn randomize(mut rng: impl rand::Rng) -> Self {
+        let amount = 2;
+        fn rand_collection<T: crate::Randomize>(
+            mut rng: impl rand::Rng,
+            amount: usize,
+        ) -> Vec<T> {
+            std::iter::repeat_with(|| crate::Randomize::randomize(&mut rng))
+                .take(amount)
+                .collect()
+        }
+
+        Self {
+            coins: rand_collection(&mut rng, amount),
+            messages: rand_collection(&mut rng, amount),
+            blobs: rand_collection(&mut rng, amount),
+            contracts: rand_collection(&mut rng, amount),
+            last_block: Some(LastBlockConfig {
+                block_height: rng.gen(),
+                da_block_height: rng.gen(),
+                consensus_parameters_version: rng.gen(),
+                state_transition_version: rng.gen(),
+                blocks_root: rng.gen(),
+            }),
+        }
+    }
+}
+
+pub trait AsTable<T>
+where
+    T: TableWithBlueprint,
+{
+    fn as_table(&self) -> Vec<TableEntry<T>>;
+}
+
+impl AsTable<Messages> for StateConfig {
+    fn as_table(&self) -> Vec<TableEntry<Messages>> {
+        self.messages
+            .clone()
+            .into_iter()
+            .map(|message| message.into())
+            .collect()
+    }
+}
+
+impl AddTable<Messages> for StateConfigBuilder {
+    fn add(&mut self, entries: Vec<TableEntry<Messages>>) {
+        self.messages.extend(entries);
+    }
+}
+
+impl AsTable<BlobData> for StateConfig {
+    fn as_table(&self) -> Vec<TableEntry<BlobData>> {
+        self.blobs
+            .clone()
+            .into_iter()
+            .map(|blob| blob.into())
+            .collect()
+    }
+}
+
+impl AddTable<BlobData> for StateConfigBuilder {
+    fn add(&mut self, entries: Vec<TableEntry<BlobData>>) {
+        self.blobs.extend(entries);
+    }
+}
+
+impl AsTable<ContractsState> for StateConfig {
+    fn as_table(&self) -> Vec<TableEntry<ContractsState>> {
+        self.contracts
+            .iter()
+            .flat_map(|contract| {
+                contract.states.iter().map(
+                    |ContractStateConfig {
+                         key: state_key,
+                         value: state_value,
+                     }| TableEntry {
+                        key: ContractsStateKey::new(&contract.contract_id, state_key),
+                        value: state_value.clone().into(),
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
+impl AddTable<ContractsState> for StateConfigBuilder {
+    fn add(&mut self, entries: Vec<TableEntry<ContractsState>>) {
+        self.contract_state.extend(entries);
+    }
+}
+
+impl AsTable<ContractsAssets> for StateConfig {
+    fn as_table(&self) -> Vec<TableEntry<ContractsAssets>> {
+        self.contracts
+            .iter()
+            .flat_map(|contract| {
+                contract.balances.iter().map(
+                    |ContractBalanceConfig { asset_id, amount }| TableEntry {
+                        key: ContractsAssetKey::new(&contract.contract_id, asset_id),
+                        value: *amount,
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
+impl AddTable<ContractsAssets> for StateConfigBuilder {
+    fn add(&mut self, entries: Vec<TableEntry<ContractsAssets>>) {
+        self.contract_balance.extend(entries);
+    }
+}
+
+impl AsTable<ContractsRawCode> for StateConfig {
+    fn as_table(&self) -> Vec<TableEntry<ContractsRawCode>> {
+        self.contracts
+            .iter()
+            .map(|config| TableEntry {
+                key: config.contract_id,
+                value: config.code.as_slice().into(),
+            })
+            .collect()
+    }
+}
+
+impl AddTable<ContractsRawCode> for StateConfigBuilder {
+    fn add(&mut self, entries: Vec<TableEntry<ContractsRawCode>>) {
+        self.contract_code.extend(entries);
+    }
+}
+
+impl AsTable<ContractsLatestUtxo> for StateConfig {
+    fn as_table(&self) -> Vec<TableEntry<ContractsLatestUtxo>> {
+        self.contracts
+            .iter()
+            .map(|config| TableEntry {
+                key: config.contract_id,
+                value: ContractUtxoInfo::V1(
+                    fuel_core_types::entities::contract::ContractUtxoInfoV1 {
+                        utxo_id: config.utxo_id(),
+                        tx_pointer: config.tx_pointer(),
+                    },
+                ),
+            })
+            .collect()
+    }
+}
+
+impl AddTable<ContractsLatestUtxo> for StateConfigBuilder {
+    fn add(&mut self, entries: Vec<TableEntry<ContractsLatestUtxo>>) {
+        self.contract_utxo.extend(entries);
+    }
+}
+
+impl AsTable<Transactions> for StateConfig {
+    fn as_table(&self) -> Vec<TableEntry<Transactions>> {
+        Vec::new() // Do not include these for now
+    }
+}
+
+impl AddTable<Transactions> for StateConfigBuilder {
+    fn add(&mut self, _entries: Vec<TableEntry<Transactions>>) {}
+}
+
+impl AsTable<FuelBlocks> for StateConfig {
+    fn as_table(&self) -> Vec<TableEntry<FuelBlocks>> {
+        Vec::new() // Do not include these for now
+    }
+}
+
+impl AddTable<FuelBlocks> for StateConfigBuilder {
+    fn add(&mut self, _entries: Vec<TableEntry<FuelBlocks>>) {}
+}
+
+impl AsTable<SealedBlockConsensus> for StateConfig {
+    fn as_table(&self) -> Vec<TableEntry<SealedBlockConsensus>> {
+        Vec::new() // Do not include these for now
+    }
+}
+
+impl AddTable<SealedBlockConsensus> for StateConfigBuilder {
+    fn add(&mut self, _entries: Vec<TableEntry<SealedBlockConsensus>>) {}
+}
+
+impl AsTable<FuelBlockMerkleData> for StateConfig {
+    fn as_table(&self) -> Vec<TableEntry<FuelBlockMerkleData>> {
+        Vec::new() // Do not include these for now
+    }
+}
+
+impl AddTable<FuelBlockMerkleData> for StateConfigBuilder {
+    fn add(&mut self, _entries: Vec<TableEntry<FuelBlockMerkleData>>) {}
+}
+
+impl AsTable<FuelBlockMerkleMetadata> for StateConfig {
+    fn as_table(&self) -> Vec<TableEntry<FuelBlockMerkleMetadata>> {
+        Vec::new() // Do not include these for now
+    }
+}
+
+impl AddTable<FuelBlockMerkleMetadata> for StateConfigBuilder {
+    fn add(&mut self, _entries: Vec<TableEntry<FuelBlockMerkleMetadata>>) {}
+}
+
+impl AddTable<ProcessedTransactions> for StateConfigBuilder {
+    fn add(&mut self, _: Vec<TableEntry<ProcessedTransactions>>) {}
+}
+
+impl AsTable<ProcessedTransactions> for StateConfig {
+    fn as_table(&self) -> Vec<TableEntry<ProcessedTransactions>> {
+        Vec::new() // Do not include these for now
+    }
 }
 
 impl StateConfig {
+    pub fn sorted(mut self) -> Self {
+        self.coins = self
+            .coins
+            .into_iter()
+            .sorted_by_key(|c| c.utxo_id())
+            .collect();
+
+        self.messages = self
+            .messages
+            .into_iter()
+            .sorted_by_key(|m| m.nonce)
+            .collect();
+
+        self.blobs = self
+            .blobs
+            .into_iter()
+            .sorted_by_key(|b| b.blob_id)
+            .collect();
+
+        self.contracts = self
+            .contracts
+            .into_iter()
+            .sorted_by_key(|c| c.contract_id)
+            .collect();
+
+        self
+    }
+
     pub fn extend(&mut self, other: Self) {
         self.coins.extend(other.coins);
         self.messages.extend(other.messages);
         self.contracts.extend(other.contracts);
-        self.contract_state.extend(other.contract_state);
-        self.contract_balance.extend(other.contract_balance);
-    }
-
-    pub fn generate_state_config(db: impl ChainStateDb) -> StorageResult<Self> {
-        let coins = db.iter_coin_configs().try_collect()?;
-        let messages = db.iter_message_configs().try_collect()?;
-        let contracts = db.iter_contract_configs().try_collect()?;
-        let contract_state = db.iter_contract_state_configs().try_collect()?;
-        let contract_balance = db.iter_contract_balance_configs().try_collect()?;
-        let block = db.get_last_block()?;
-
-        Ok(Self {
-            coins,
-            messages,
-            contracts,
-            contract_state,
-            contract_balance,
-            block_height: *block.header().height(),
-            da_block_height: block.header().da_height,
-        })
     }
 
     #[cfg(feature = "std")]
     pub fn from_snapshot_metadata(
         snapshot_metadata: SnapshotMetadata,
     ) -> anyhow::Result<Self> {
-        let reader = crate::StateReader::for_snapshot(snapshot_metadata)?;
+        let reader = crate::SnapshotReader::open(snapshot_metadata)?;
         Self::from_reader(&reader)
     }
 
-    pub fn from_reader(reader: &StateReader) -> anyhow::Result<Self> {
+    #[cfg(feature = "std")]
+    pub fn from_reader(reader: &SnapshotReader) -> anyhow::Result<Self> {
+        let mut builder = StateConfigBuilder::default();
+
         let coins = reader
-            .coins()?
-            .map_ok(|group| group.data)
+            .read::<Coins>()?
+            .into_iter()
             .flatten_ok()
             .try_collect()?;
+
+        builder.add(coins);
 
         let messages = reader
-            .messages()?
-            .map_ok(|group| group.data)
+            .read::<Messages>()?
+            .into_iter()
             .flatten_ok()
             .try_collect()?;
 
-        let contracts = reader
-            .contracts()?
-            .map_ok(|group| group.data)
+        builder.add(messages);
+
+        let blobs = reader
+            .read::<BlobData>()?
+            .into_iter()
             .flatten_ok()
             .try_collect()?;
+
+        builder.add(blobs);
 
         let contract_state = reader
-            .contract_state()?
-            .map_ok(|group| group.data)
+            .read::<ContractsState>()?
+            .into_iter()
             .flatten_ok()
             .try_collect()?;
+
+        builder.add(contract_state);
 
         let contract_balance = reader
-            .contract_balance()?
-            .map_ok(|group| group.data)
+            .read::<ContractsAssets>()?
+            .into_iter()
             .flatten_ok()
             .try_collect()?;
 
-        let block_height = reader.block_height();
-        let da_block_height = reader.da_block_height();
+        builder.add(contract_balance);
 
-        Ok(Self {
-            coins,
-            messages,
-            contracts,
-            contract_state,
-            contract_balance,
-            block_height,
-            da_block_height,
-        })
+        let contract_code = reader
+            .read::<ContractsRawCode>()?
+            .into_iter()
+            .flatten_ok()
+            .try_collect()?;
+
+        builder.add(contract_code);
+
+        let contract_utxo = reader
+            .read::<ContractsLatestUtxo>()?
+            .into_iter()
+            .flatten_ok()
+            .try_collect()?;
+
+        builder.add(contract_utxo);
+
+        builder.build(reader.last_block_config().cloned())
     }
 
-    pub fn from_db(db: impl ChainStateDb) -> anyhow::Result<Self> {
-        let coins = db.iter_coin_configs().try_collect()?;
-        let messages = db.iter_message_configs().try_collect()?;
-        let contracts = db.iter_contract_configs().try_collect()?;
-        let contract_state = db.iter_contract_state_configs().try_collect()?;
-        let contract_balance = db.iter_contract_balance_configs().try_collect()?;
-        let block = db.get_last_block()?;
-
-        Ok(Self {
-            coins,
-            messages,
-            contracts,
-            contract_state,
-            contract_balance,
-            block_height: *block.header().height(),
-            da_block_height: block.header().da_height,
-        })
-    }
-
+    #[cfg(feature = "test-helpers")]
     pub fn local_testnet() -> Self {
         // endow some preset accounts with an initial balance
         tracing::info!("Initial Accounts");
@@ -208,7 +631,7 @@ impl StateConfig {
         }
     }
 
-    #[cfg(feature = "random")]
+    #[cfg(feature = "test-helpers")]
     pub fn random_testnet() -> Self {
         tracing::info!("Initial Accounts");
         let mut rng = rand::thread_rng();
@@ -238,61 +661,29 @@ impl StateConfig {
     }
 }
 
-#[impl_tools::autoimpl(for<T: trait> &T, &mut T)]
-pub trait ChainStateDb {
-    /// Returns the contract config along with its state and balance
-    fn get_contract_by_id(
-        &self,
-        contract_id: fuel_core_types::fuel_types::ContractId,
-    ) -> StorageResult<(
-        ContractConfig,
-        Vec<ContractStateConfig>,
-        Vec<ContractBalanceConfig>,
-    )>;
-    /// Returns *all* unspent coin configs available in the database.
-    fn iter_coin_configs(&self) -> BoxedIter<StorageResult<CoinConfig>>;
-    /// Returns *alive* contract configs available in the database.
-    fn iter_contract_configs(&self) -> BoxedIter<StorageResult<ContractConfig>>;
-
-    /// Returns the state of all contracts
-    fn iter_contract_state_configs(
-        &self,
-    ) -> BoxedIter<StorageResult<ContractStateConfig>>;
-    /// Returns the balances of all contracts
-    fn iter_contract_balance_configs(
-        &self,
-    ) -> BoxedIter<StorageResult<ContractBalanceConfig>>;
-    /// Returns *all* unspent message configs available in the database.
-    fn iter_message_configs(&self) -> BoxedIter<StorageResult<MessageConfig>>;
-    /// Returns the last available block.
-    fn get_last_block(&self) -> StorageResult<CompressedBlock>;
-}
-
 pub use reader::{
-    IntoIter,
-    StateReader,
+    GroupIter,
+    Groups,
+    SnapshotReader,
 };
-#[cfg(feature = "std")]
-pub use writer::StateWriter;
 #[cfg(feature = "parquet")]
 pub use writer::ZstdCompressionLevel;
+#[cfg(feature = "std")]
+pub use writer::{
+    SnapshotFragment,
+    SnapshotWriter,
+};
 pub const MAX_GROUP_SIZE: usize = usize::MAX;
 
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub struct Group<T> {
-    pub index: usize,
-    pub data: Vec<T>,
-}
-pub(crate) type GroupResult<T> = anyhow::Result<Group<T>>;
-
-#[cfg(all(feature = "std", feature = "random"))]
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use crate::{
-        self as fuel_core_chain_config,
-        Group,
+        ChainConfig,
+        Randomize,
     };
-    use itertools::Itertools;
+
     use rand::{
         rngs::StdRng,
         SeedableRng,
@@ -300,341 +691,223 @@ mod tests {
 
     use super::*;
 
-    #[cfg(feature = "parquet")]
     #[test]
-    fn roundtrip_parquet_coins() {
-        // given
-        let skip_n_groups = 3;
-        let temp_dir = tempfile::tempdir().unwrap();
+    fn parquet_roundtrip() {
+        let writer = given_parquet_writer;
 
-        let mut group_generator = GroupGenerator::new(StdRng::seed_from_u64(0), 100, 10);
-        let files = crate::ParquetFiles::snapshot_default(temp_dir.path());
-        let mut encoder =
-            StateWriter::parquet(&files, writer::ZstdCompressionLevel::Uncompressed)
-                .unwrap();
-        encoder.write_block_data(0u32.into(), 0u64.into()).unwrap();
+        let reader = |metadata: SnapshotMetadata, _: usize| {
+            SnapshotReader::open(metadata).unwrap()
+        };
 
-        // when
-        let coin_groups =
-            group_generator.for_each_group(|group| encoder.write_coins(group));
-        encoder.close().unwrap();
+        macro_rules! test_tables {
+                ($($table:ty),*) => {
+                    $(assert_roundtrip::<$table>(writer, reader);)*
+                };
+            }
 
-        let decoded_coin_groups = StateReader::parquet(files)
-            .unwrap()
-            .coins()
-            .unwrap()
-            .collect_vec();
-
-        // then
-        assert_groups_identical(&coin_groups, decoded_coin_groups, skip_n_groups);
-    }
-
-    #[cfg(feature = "parquet")]
-    #[test]
-    fn roundtrip_parquet_messages() {
-        // given
-        let skip_n_groups = 3;
-        let temp_dir = tempfile::tempdir().unwrap();
-
-        let mut group_generator = GroupGenerator::new(StdRng::seed_from_u64(0), 100, 10);
-        let files = crate::ParquetFiles::snapshot_default(temp_dir.path());
-        let mut encoder =
-            StateWriter::parquet(&files, writer::ZstdCompressionLevel::Level1).unwrap();
-        encoder.write_block_data(0u32.into(), 0u64.into()).unwrap();
-
-        // when
-        let message_groups =
-            group_generator.for_each_group(|group| encoder.write_messages(group));
-        encoder.close().unwrap();
-        let messages_decoded = StateReader::parquet(files)
-            .unwrap()
-            .messages()
-            .unwrap()
-            .collect_vec();
-
-        // then
-        assert_groups_identical(&message_groups, messages_decoded, skip_n_groups);
-    }
-
-    #[cfg(feature = "parquet")]
-    #[test]
-    fn roundtrip_parquet_contracts() {
-        // given
-        let skip_n_groups = 3;
-        let temp_dir = tempfile::tempdir().unwrap();
-
-        let mut group_generator = GroupGenerator::new(StdRng::seed_from_u64(0), 100, 10);
-        let files = crate::ParquetFiles::snapshot_default(temp_dir.path());
-        let mut encoder =
-            StateWriter::parquet(&files, writer::ZstdCompressionLevel::Level1).unwrap();
-        encoder.write_block_data(0u32.into(), 0u64.into()).unwrap();
-
-        // when
-        let contract_groups =
-            group_generator.for_each_group(|group| encoder.write_contracts(group));
-        encoder.close().unwrap();
-        let contract_decoded = StateReader::parquet(files)
-            .unwrap()
-            .contracts()
-            .unwrap()
-            .collect_vec();
-
-        // then
-        assert_groups_identical(&contract_groups, contract_decoded, skip_n_groups);
-    }
-
-    #[cfg(feature = "parquet")]
-    #[test]
-    fn roundtrip_parquet_contract_state() {
-        // given
-        let skip_n_groups = 3;
-        let temp_dir = tempfile::tempdir().unwrap();
-
-        let mut group_generator = GroupGenerator::new(StdRng::seed_from_u64(0), 100, 10);
-        let files = crate::ParquetFiles::snapshot_default(temp_dir.path());
-        let mut encoder =
-            StateWriter::parquet(&files, writer::ZstdCompressionLevel::Level1).unwrap();
-        encoder.write_block_data(0u32.into(), 0u64.into()).unwrap();
-
-        // when
-        let contract_state_groups =
-            group_generator.for_each_group(|group| encoder.write_contract_state(group));
-        encoder.close().unwrap();
-        let decoded_contract_state = StateReader::parquet(files)
-            .unwrap()
-            .contract_state()
-            .unwrap()
-            .collect_vec();
-
-        // then
-        assert_groups_identical(
-            &contract_state_groups,
-            decoded_contract_state,
-            skip_n_groups,
+        test_tables!(
+            Coins,
+            BlobData,
+            ContractsAssets,
+            ContractsLatestUtxo,
+            ContractsRawCode,
+            ContractsState,
+            Messages
         );
     }
 
-    #[cfg(feature = "parquet")]
-    #[test]
-    fn roundtrip_parquet_contract_balance() {
-        // given
-        let skip_n_groups = 3;
-        let temp_dir = tempfile::tempdir().unwrap();
-
-        let mut group_generator = GroupGenerator::new(StdRng::seed_from_u64(0), 100, 10);
-        let files = crate::ParquetFiles::snapshot_default(temp_dir.path());
-        let mut encoder =
-            StateWriter::parquet(&files, writer::ZstdCompressionLevel::Level1).unwrap();
-        encoder.write_block_data(0u32.into(), 0u64.into()).unwrap();
-
-        // when
-        let contract_balance_groups =
-            group_generator.for_each_group(|group| encoder.write_contract_balance(group));
-        encoder.close().unwrap();
-
-        let decoded_contract_balance = StateReader::parquet(files)
-            .unwrap()
-            .contract_balance()
-            .unwrap()
-            .collect_vec();
-
-        // then
-        assert_groups_identical(
-            &contract_balance_groups,
-            decoded_contract_balance,
-            skip_n_groups,
-        );
+    fn given_parquet_writer(path: &Path) -> SnapshotWriter {
+        SnapshotWriter::parquet(path, writer::ZstdCompressionLevel::Level1).unwrap()
     }
 
-    #[cfg(feature = "parquet")]
+    fn given_json_writer(path: &Path) -> SnapshotWriter {
+        SnapshotWriter::json(path)
+    }
+
     #[test]
-    fn roundtrip_parquet_block_height() {
+    fn json_roundtrip_non_contract_related_tables() {
+        let writer = |temp_dir: &Path| SnapshotWriter::json(temp_dir);
+        let reader = |metadata: SnapshotMetadata, group_size: usize| {
+            SnapshotReader::open_w_config(metadata, group_size).unwrap()
+        };
+
+        assert_roundtrip::<Coins>(writer, reader);
+        assert_roundtrip::<Messages>(writer, reader);
+        assert_roundtrip::<BlobData>(writer, reader);
+    }
+
+    #[test]
+    fn json_roundtrip_contract_related_tables() {
+        // given
+        let mut rng = StdRng::seed_from_u64(0);
+        let contracts = std::iter::repeat_with(|| ContractConfig::randomize(&mut rng))
+            .take(4)
+            .collect_vec();
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let writer = SnapshotWriter::json(tmp_dir.path());
+
+        let state = StateConfig {
+            contracts,
+            ..Default::default()
+        };
+
+        // when
+        let snapshot = writer
+            .write_state_config(state.clone(), &ChainConfig::local_testnet())
+            .unwrap();
+
+        // then
+        let reader = SnapshotReader::open(snapshot).unwrap();
+        let read_state = StateConfig::from_reader(&reader).unwrap();
+
+        pretty_assertions::assert_eq!(state, read_state);
+    }
+
+    #[test_case::test_case(given_parquet_writer)]
+    #[test_case::test_case(given_json_writer)]
+    fn writes_in_fragments_correctly(writer: impl Fn(&Path) -> SnapshotWriter + Copy) {
         // given
         let temp_dir = tempfile::tempdir().unwrap();
-        let files = crate::ParquetFiles::snapshot_default(temp_dir.path());
-        let mut encoder =
-            StateWriter::parquet(&files, writer::ZstdCompressionLevel::Level1).unwrap();
+        let create_writer = || writer(temp_dir.path());
+
+        let mut rng = StdRng::seed_from_u64(0);
+        let state_config = StateConfig::randomize(&mut rng);
+
+        let chain_config = ChainConfig::local_testnet();
+
+        macro_rules! write_in_fragments {
+            ($($fragment_ty: ty,)*) => {[
+                $({
+                    let mut writer = create_writer();
+                    writer
+                        .write(AsTable::<$fragment_ty>::as_table(&state_config))
+                        .unwrap();
+                    writer.partial_close().unwrap()
+                }),*
+            ]}
+        }
+
+        let fragments = write_in_fragments!(
+            Coins,
+            Messages,
+            BlobData,
+            ContractsState,
+            ContractsAssets,
+            ContractsRawCode,
+            ContractsLatestUtxo,
+        );
+
+        // when
+        let snapshot = fragments
+            .into_iter()
+            .reduce(|fragment, next_fragment| fragment.merge(next_fragment).unwrap())
+            .unwrap()
+            .finalize(state_config.last_block, &chain_config)
+            .unwrap();
+
+        // then
+        let reader = SnapshotReader::open(snapshot).unwrap();
+
+        let read_state_config = StateConfig::from_reader(&reader).unwrap();
+        assert_eq!(read_state_config, state_config);
+        assert_eq!(reader.chain_config(), &chain_config);
+    }
+
+    #[test_case::test_case(given_parquet_writer)]
+    #[test_case::test_case(given_json_writer)]
+    fn roundtrip_block_heights(writer: impl FnOnce(&Path) -> SnapshotWriter) {
+        // given
+        let temp_dir = tempfile::tempdir().unwrap();
         let block_height = 13u32.into();
         let da_block_height = 14u64.into();
+        let consensus_parameters_version = 321u32;
+        let state_transition_version = 123u32;
+        let blocks_root = Bytes32::from([123; 32]);
+        let block_config = LastBlockConfig {
+            block_height,
+            da_block_height,
+            consensus_parameters_version,
+            state_transition_version,
+            blocks_root,
+        };
+        let writer = writer(temp_dir.path());
 
         // when
-        encoder
-            .write_block_data(block_height, da_block_height)
+        let snapshot = writer
+            .close(Some(block_config), &ChainConfig::local_testnet())
             .unwrap();
-        encoder.close().unwrap();
 
         // then
-        let reader = StateReader::parquet(files).unwrap();
-        let block_height_decoded = reader.block_height();
-        let da_block_height_decoded = reader.da_block_height();
-        assert_eq!(block_height, block_height_decoded);
-        assert_eq!(da_block_height, da_block_height_decoded);
+        let reader = SnapshotReader::open(snapshot).unwrap();
+
+        let block_config_decoded = reader.last_block_config().cloned();
+        pretty_assertions::assert_eq!(Some(block_config), block_config_decoded);
     }
 
-    #[test]
-    fn roundtrip_json_coins() {
+    #[test_case::test_case(given_parquet_writer)]
+    #[test_case::test_case(given_json_writer)]
+    fn missing_tables_tolerated(writer: impl FnOnce(&Path) -> SnapshotWriter) {
+        // given
+        let temp_dir = tempfile::tempdir().unwrap();
+        let writer = writer(temp_dir.path());
+        let snapshot = writer.close(None, &ChainConfig::local_testnet()).unwrap();
+
+        let reader = SnapshotReader::open(snapshot).unwrap();
+
+        // when
+        let coins = reader.read::<Coins>().unwrap();
+
+        // then
+        assert_eq!(coins.into_iter().count(), 0);
+    }
+
+    fn assert_roundtrip<T>(
+        writer: impl FnOnce(&Path) -> SnapshotWriter,
+        reader: impl FnOnce(SnapshotMetadata, usize) -> SnapshotReader,
+    ) where
+        T: TableWithBlueprint,
+        T::OwnedKey: Randomize
+            + serde::Serialize
+            + serde::de::DeserializeOwned
+            + core::fmt::Debug
+            + PartialEq,
+        T::OwnedValue: Randomize
+            + serde::Serialize
+            + serde::de::DeserializeOwned
+            + core::fmt::Debug
+            + PartialEq,
+        StateConfig: AsTable<T>,
+        TableEntry<T>: Randomize,
+        StateConfigBuilder: AddTable<T>,
+    {
         // given
         let skip_n_groups = 3;
-        let group_size = 100;
         let temp_dir = tempfile::tempdir().unwrap();
-        let file = temp_dir.path().join("state_config.json");
 
-        let mut encoder = StateWriter::json(&file);
+        let num_groups = 4;
+        let group_size = 1;
         let mut group_generator =
-            GroupGenerator::new(StdRng::seed_from_u64(0), group_size, 10);
+            GroupGenerator::new(StdRng::seed_from_u64(0), group_size, num_groups);
+        let mut snapshot_writer = writer(temp_dir.path());
 
         // when
-        let coin_groups =
-            group_generator.for_each_group(|group| encoder.write_coins(group));
-        encoder.close().unwrap();
-
-        let decoded_coins = StateReader::json(file, group_size)
-            .unwrap()
-            .coins()
-            .unwrap()
+        let expected_groups = group_generator
+            .write_groups::<T>(&mut snapshot_writer)
+            .into_iter()
             .collect_vec();
-
-        // then
-        assert_groups_identical(&coin_groups, decoded_coins, skip_n_groups);
-    }
-
-    #[test]
-    fn roundtrip_json_messages() {
-        // given
-        let skip_n_groups = 3;
-        let group_size = 100;
-        let temp_dir = tempfile::tempdir().unwrap();
-        let file = temp_dir.path().join("state_config.json");
-
-        let mut encoder = StateWriter::json(&file);
-        let mut group_generator =
-            GroupGenerator::new(StdRng::seed_from_u64(0), group_size, 10);
-
-        // when
-        let message_groups =
-            group_generator.for_each_group(|group| encoder.write_messages(group));
-        encoder.close().unwrap();
-
-        let decoded_messages = StateReader::json(&file, group_size)
-            .unwrap()
-            .messages()
-            .unwrap()
-            .collect_vec();
-
-        // then
-        assert_groups_identical(&message_groups, decoded_messages, skip_n_groups);
-    }
-
-    #[test]
-    fn roundtrip_json_contracts() {
-        // given
-        let skip_n_groups = 3;
-        let group_size = 100;
-        let temp_dir = tempfile::tempdir().unwrap();
-        let file = temp_dir.path().join("state_config.json");
-
-        let mut encoder = StateWriter::json(&file);
-        let mut group_generator =
-            GroupGenerator::new(StdRng::seed_from_u64(0), group_size, 10);
-
-        // when
-        let contract_groups =
-            group_generator.for_each_group(|group| encoder.write_contracts(group));
-        encoder.close().unwrap();
-
-        let decoded_contracts = StateReader::json(&file, group_size)
-            .unwrap()
-            .contracts()
-            .unwrap()
-            .collect_vec();
-
-        // then
-        assert_groups_identical(&contract_groups, decoded_contracts, skip_n_groups);
-    }
-
-    #[test]
-    fn roundtrip_json_contract_state() {
-        // given
-        let skip_n_groups = 3;
-        let group_size = 100;
-        let temp_dir = tempfile::tempdir().unwrap();
-        let file = temp_dir.path().join("state_config.json");
-
-        let mut encoder = StateWriter::json(&file);
-        let mut group_generator =
-            GroupGenerator::new(StdRng::seed_from_u64(0), group_size, 10);
-
-        // when
-        let contract_state_groups =
-            group_generator.for_each_group(|group| encoder.write_contract_state(group));
-        encoder.close().unwrap();
-
-        let decoded_contract_state = StateReader::json(&file, group_size)
-            .unwrap()
-            .contract_state()
-            .unwrap()
-            .collect_vec();
-
-        // then
-        assert_groups_identical(
-            &contract_state_groups,
-            decoded_contract_state,
-            skip_n_groups,
-        );
-    }
-
-    #[test]
-    fn roundtrip_json_contract_balance() {
-        // given
-        let skip_n_groups = 3;
-        let group_size = 100;
-        let temp_dir = tempfile::tempdir().unwrap();
-        let file = temp_dir.path().join("state_config.json");
-
-        let mut encoder = StateWriter::json(&file);
-        let mut group_generator =
-            GroupGenerator::new(StdRng::seed_from_u64(0), group_size, 10);
-
-        // when
-        let contract_balance_groups =
-            group_generator.for_each_group(|group| encoder.write_contract_balance(group));
-        encoder.close().unwrap();
-
-        let decoded_contract_balance = StateReader::json(&file, group_size)
-            .unwrap()
-            .contract_balance()
-            .unwrap()
-            .collect_vec();
-
-        // then
-        assert_groups_identical(
-            &contract_balance_groups,
-            decoded_contract_balance,
-            skip_n_groups,
-        );
-    }
-
-    #[test]
-    fn roundtrip_json_block_height() {
-        // given
-        let temp_dir = tempfile::tempdir().unwrap();
-        let file = temp_dir.path().join("state_config.json");
-        let block_height = 13u32.into();
-        let da_block_height = 14u64.into();
-        let mut encoder = StateWriter::json(&file);
-
-        // when
-        encoder
-            .write_block_data(block_height, da_block_height)
+        let snapshot = snapshot_writer
+            .close(None, &ChainConfig::local_testnet())
             .unwrap();
-        encoder.close().unwrap();
+
+        let actual_groups = reader(snapshot, group_size)
+            .read()
+            .unwrap()
+            .into_iter()
+            .collect_vec();
 
         // then
-        let reader = StateReader::json(&file, 100).unwrap();
-        let block_height_decoded = reader.block_height();
-        let da_block_height_decoded = reader.da_block_height();
-        assert_eq!(block_height, block_height_decoded);
-        assert_eq!(da_block_height, da_block_height_decoded);
+        assert_groups_identical(&expected_groups, actual_groups, skip_n_groups);
     }
 
     struct GroupGenerator<R> {
@@ -651,33 +924,41 @@ mod tests {
                 num_groups,
             }
         }
-        fn for_each_group<T: fuel_core_chain_config::Randomize + Clone>(
+
+        fn write_groups<T>(
             &mut self,
-            mut f: impl FnMut(Vec<T>) -> anyhow::Result<()>,
-        ) -> Vec<Group<T>> {
+            encoder: &mut SnapshotWriter,
+        ) -> Vec<Vec<TableEntry<T>>>
+        where
+            T: TableWithBlueprint,
+            T::OwnedKey: serde::Serialize,
+            T::OwnedValue: serde::Serialize,
+            TableEntry<T>: Randomize,
+            StateConfigBuilder: AddTable<T>,
+        {
             let groups = self.generate_groups();
             for group in &groups {
-                f(group.data.clone()).unwrap();
+                encoder.write(group.clone()).unwrap();
             }
             groups
         }
-        fn generate_groups<T: fuel_core_chain_config::Randomize>(
-            &mut self,
-        ) -> Vec<Group<T>> {
+
+        fn generate_groups<T>(&mut self) -> Vec<Vec<T>>
+        where
+            T: Randomize,
+        {
             ::std::iter::repeat_with(|| T::randomize(&mut self.rand))
                 .chunks(self.group_size)
                 .into_iter()
                 .map(|chunk| chunk.collect_vec())
-                .enumerate()
-                .map(|(index, data)| Group { index, data })
                 .take(self.num_groups)
                 .collect()
         }
     }
 
     fn assert_groups_identical<T>(
-        original: &[Group<T>],
-        read: impl IntoIterator<Item = Result<Group<T>, anyhow::Error>>,
+        original: &[Vec<T>],
+        read: impl IntoIterator<Item = Result<Vec<T>, anyhow::Error>>,
         skip: usize,
     ) where
         Vec<T>: PartialEq,

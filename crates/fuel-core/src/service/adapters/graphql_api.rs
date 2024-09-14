@@ -1,19 +1,22 @@
 use super::{
     BlockImporterAdapter,
     BlockProducerAdapter,
+    ConsensusParametersProvider,
     StaticGasPrice,
 };
 use crate::{
-    database::Database,
+    database::OnChainIterableKeyValueView,
     fuel_core_graphql_api::ports::{
         worker,
         BlockProducerPort,
+        ConsensusProvider,
         DatabaseMessageProof,
         GasPriceEstimate,
         P2pPort,
         TxPoolPort,
     },
     service::adapters::{
+        import_result_provider::ImportResultProvider,
         P2PAdapter,
         TxPoolAdapter,
     },
@@ -26,9 +29,11 @@ use fuel_core_txpool::{
     types::TxId,
 };
 use fuel_core_types::{
-    entities::message::MerkleProof,
+    blockchain::header::ConsensusParametersVersion,
+    entities::relayer::message::MerkleProof,
     fuel_tx::{
         Bytes32,
+        ConsensusParameters,
         Transaction,
     },
     fuel_types::BlockHeight,
@@ -73,7 +78,7 @@ impl TxPoolPort for TxPoolAdapter {
             .insert(txs)
             .await
             .into_iter()
-            .map(|res| res.map_err(anyhow::Error::from))
+            .map(|res| res.map_err(|e| anyhow::anyhow!(e)))
             .collect()
     }
 
@@ -85,13 +90,13 @@ impl TxPoolPort for TxPoolAdapter {
     }
 }
 
-impl DatabaseMessageProof for Database {
+impl DatabaseMessageProof for OnChainIterableKeyValueView {
     fn block_history_proof(
         &self,
         message_block_height: &BlockHeight,
         commit_block_height: &BlockHeight,
     ) -> StorageResult<MerkleProof> {
-        Database::block_history_proof(self, message_block_height, commit_block_height)
+        self.block_history_proof(message_block_height, commit_block_height)
     }
 }
 
@@ -102,9 +107,10 @@ impl BlockProducerPort for BlockProducerAdapter {
         transactions: Vec<Transaction>,
         height: Option<BlockHeight>,
         utxo_validation: Option<bool>,
+        gas_price: Option<u64>,
     ) -> anyhow::Result<Vec<TransactionExecutionStatus>> {
         self.block_producer
-            .dry_run(transactions, height, utxo_validation)
+            .dry_run(transactions, height, utxo_validation, gas_price)
             .await
     }
 }
@@ -147,12 +153,6 @@ impl P2pPort for P2PAdapter {
     }
 }
 
-impl worker::BlockImporter for BlockImporterAdapter {
-    fn block_events(&self) -> BoxStream<SharedImportResult> {
-        self.events()
-    }
-}
-
 impl worker::TxPool for TxPoolAdapter {
     fn send_complete(
         &self,
@@ -166,7 +166,51 @@ impl worker::TxPool for TxPoolAdapter {
 
 #[async_trait::async_trait]
 impl GasPriceEstimate for StaticGasPrice {
-    async fn worst_case_gas_price(&self, _height: BlockHeight) -> u64 {
-        self.gas_price
+    async fn worst_case_gas_price(&self, _height: BlockHeight) -> Option<u64> {
+        Some(self.gas_price)
+    }
+}
+
+impl ConsensusProvider for ConsensusParametersProvider {
+    fn latest_consensus_params(&self) -> Arc<ConsensusParameters> {
+        self.shared_state.latest_consensus_parameters()
+    }
+
+    fn consensus_params_at_version(
+        &self,
+        version: &ConsensusParametersVersion,
+    ) -> anyhow::Result<Arc<ConsensusParameters>> {
+        Ok(self.shared_state.get_consensus_parameters(version)?)
+    }
+}
+
+#[derive(Clone)]
+pub struct GraphQLBlockImporter {
+    block_importer_adapter: BlockImporterAdapter,
+    import_result_provider_adapter: ImportResultProvider,
+}
+
+impl GraphQLBlockImporter {
+    pub fn new(
+        block_importer_adapter: BlockImporterAdapter,
+        import_result_provider_adapter: ImportResultProvider,
+    ) -> Self {
+        Self {
+            block_importer_adapter,
+            import_result_provider_adapter,
+        }
+    }
+}
+
+impl worker::BlockImporter for GraphQLBlockImporter {
+    fn block_events(&self) -> BoxStream<SharedImportResult> {
+        self.block_importer_adapter.events_shared_result()
+    }
+
+    fn block_event_at_height(
+        &self,
+        height: Option<BlockHeight>,
+    ) -> anyhow::Result<SharedImportResult> {
+        self.import_result_provider_adapter.result_at_height(height)
     }
 }
